@@ -1,0 +1,15 @@
+{
+  "default_app": "app-a",
+  "tenant": "your-tenant",
+  "api_token_env": "MPULSE_API_TOKEN",
+  "apps": {
+    "app-a": {
+      "api_key": "XXXXX-XXXXX-XXXXX-XXXXX-XXXXX"
+    },
+    "app-b": {
+      "api_key": "YYYYY-YYYYY-YYYYY-YYYYY-YYYYY",
+      "tenant": "override-if-different",
+      "api_token_env": "MPULSE_API_TOKEN_APP_B"
+    }
+  }
+}

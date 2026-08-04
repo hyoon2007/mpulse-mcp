@@ -1,0 +1,26 @@
+# Secrets & local config (never commit)
+.env
+.env.*
+!.env.example
+mpulse_apps.json
+!mpulse_apps.example.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Local Claude Code settings (machine-specific)
+.claude/settings.local.json
+
+# OS
+.DS_Store

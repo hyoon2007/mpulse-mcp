@@ -1,0 +1,141 @@
+"""Regression tests for the reference catalog and its wiring.
+
+Covers the additions made when the enum catalog was introduced:
+* ``catalog.json`` parses and the built-in enums have their expected sizes.
+* ``catalog.enrich_describe`` returns the right valid-value hints per endpoint.
+* ``describe_query`` actually merges those hints into its output.
+* The ``bandwith-block`` (misspelled, verified-live) wire param and the
+  ``ThisMonth`` date-comparator are present in the metadata tables.
+
+These lock in the known-good state; if the catalog is edited the counts here
+must be updated deliberately.
+"""
+
+from __future__ import annotations
+
+from mpulse_mcp import catalog
+
+
+# --- catalog.json integrity ------------------------------------------------
+def test_catalog_json_loads() -> None:
+    data = catalog.load()
+    assert data, "catalog.json failed to load / parse"
+    # a few required top-level sections
+    for key in (
+        "metrics_for_timers_metrics__metric_param",
+        "metrics_for_metrics_by_dimension__metric_param",
+        "timers_for_timer_param",
+        "dimensions",
+        "custom_dimensions",
+    ):
+        assert key in data, f"missing catalog section: {key}"
+
+
+def test_builtin_enum_sizes() -> None:
+    data = catalog.load()
+    tm = data["metrics_for_timers_metrics__metric_param"]
+    mbd = data["metrics_for_metrics_by_dimension__metric_param"]
+    timers = data["timers_for_timer_param"]
+    dims = data["dimensions"]
+
+    # 97 documented CamelCase metrics (+ TotalRequestCount is surfaced separately)
+    assert len(tm["enum"]) == 97
+    assert tm["verified_live_extra"] == ["TotalRequestCount"]
+    assert "Beacons" in tm["enum"] and "TotalTransferSize" in tm["enum"]
+
+    assert len(mbd["enum"]) == 82
+    assert "asset_requests_per_page" in mbd["enum"]
+
+    assert len(timers["enum"]) == 24
+    assert timers["default"] == "PageLoad"
+    assert "TotalBlockingTime" in timers["enum"]
+
+    assert len(dims["dimension_values__dimension_enum"]["enum"]) == 24
+    assert len(dims["metrics_by_dimension__dimension_split_enum"]["enum"]) == 33
+
+
+# --- enrich_describe -------------------------------------------------------
+def test_enrich_timers_metrics() -> None:
+    out = catalog.enrich_describe("timers-metrics")
+    # 97 docs enum + TotalRequestCount
+    assert len(out["valid_metrics"]) == 98
+    assert "TotalRequestCount" in out["valid_metrics"]
+    assert len(out["valid_timers"]) == 24
+    assert "custom_dimensions" in out
+    assert out["gotchas"]
+    assert len(out["metric_name_differs_by_endpoint"]) == 3
+
+
+def test_enrich_metrics_by_dimension() -> None:
+    out = catalog.enrich_describe("metrics-by-dimension")
+    assert len(out["valid_metrics"]) == 82
+    assert "asset_transfer_size" in out["valid_metrics"]
+    assert len(out["valid_dimensions"]) == 33
+    assert "custom_dimensions" in out
+
+
+def test_enrich_dimension_values() -> None:
+    out = catalog.enrich_describe("dimension-values")
+    assert len(out["valid_dimensions"]) == 24
+    # connection_type is intentionally NOT a valid dimension-values dimension
+    assert "connection_type" not in out["valid_dimensions"]
+    assert "os" in out["valid_dimensions"]
+
+
+def test_enrich_unrelated_query_type_is_safe() -> None:
+    # A report with no metric/timer/dimension enums still returns a dict with the
+    # broadly-useful reference bits, and never raises.
+    out = catalog.enrich_describe("geography")
+    assert isinstance(out, dict)
+    assert "valid_metrics" not in out
+    assert "valid_timers" not in out
+    assert out["gotchas"]  # gotchas are always attached
+
+
+# --- metadata tables (query_types.py) --------------------------------------
+def test_bandwidth_param_uses_api_misspelling() -> None:
+    from mpulse_mcp.query_types import DRILLDOWN_PARAMS
+
+    assert "bandwith-block" in DRILLDOWN_PARAMS  # verified-live misspelling
+    assert "bandwidth-block" not in DRILLDOWN_PARAMS  # correct spelling doesn't work
+
+
+def test_this_month_comparator_present() -> None:
+    from mpulse_mcp.query_types import KNOWN_DATE_COMPARATORS
+
+    assert "ThisMonth" in KNOWN_DATE_COMPARATORS
+
+
+def test_server_wire_mapping_for_bandwidth() -> None:
+    # Friendly arg name stays correct; only the wire value carries the typo.
+    from mpulse_mcp.server import _DRILLDOWN_ARG_TO_WIRE
+
+    assert _DRILLDOWN_ARG_TO_WIRE["bandwidth_block"] == "bandwith-block"
+
+
+# --- describe_query wiring -------------------------------------------------
+def test_describe_query_merges_catalog() -> None:
+    from mpulse_mcp import server
+
+    # describe_query is registered via @mcp.tool(); depending on the SDK version
+    # that may return the plain function or a wrapper exposing it as .fn.
+    describe = getattr(server.describe_query, "fn", server.describe_query)
+
+    result = describe("timers-metrics")
+    assert "valid_metrics" in result
+    assert "TotalRequestCount" in result["valid_metrics"]
+    assert "valid_timers" in result
+    assert "gotchas" in result
+    # base fields are still present
+    assert result["slug"] == "timers-metrics"
+    assert "parameters" in result
+
+
+def test_describe_query_unknown_type_unchanged() -> None:
+    from mpulse_mcp import server
+
+    describe = getattr(server.describe_query, "fn", server.describe_query)
+    result = describe("not-a-real-query-type")
+    assert result["error"] == "ValidationError"
+    # enrichment must not leak onto the error path
+    assert "valid_metrics" not in result
