@@ -177,10 +177,27 @@ query-type with wire-name params, for cases the explicit tools don't cover.
 ### Output format
 
 - `raw=false` (default): a flat envelope — `app`, `query_type`, `period`,
-  `timezone`, `aggregation`, `drilldowns`, `empty`, and `body` (the
-  envelope-stripped, **loss-free** data). Empty results are flagged, with a note
-  when an unsupported drilldown combination is the likely cause.
+  `timezone`, `aggregation`, `drilldowns`, `empty`, `history_mode`, and `body`
+  (the envelope-stripped data). Empty results are flagged, with a note when an
+  unsupported drilldown combination is the likely cause.
 - `raw=true`: mPulse's untouched JSON under `data`.
+
+**`history_mode` — per-minute time-series volume (loss-free on demand).** The
+temporal query-types `timers-metrics` and `by-minute` return ~1,440 points/day,
+of which the common workload uses only the period aggregate. `history_mode`
+(on `get_timers`, `get_metrics`, and `query`) controls this:
+
+| mode | time series | always kept | ~size |
+|---|---|---|---|
+| `downsample` (**default**) | ≤60 even-spaced points + `peak` | `latest`/`statistics`, `n_points` | ~1/20 |
+| `none` | dropped (endpoints only) | `latest`/`statistics`, `n_points`, `peak` | ~1/100 |
+| `full` | every minute (loss-free) | everything | full |
+
+The complete series is always recoverable via `history_mode="full"` or
+`raw=true`. **Aggregates are never reduced**: `latest` (period value — read this
+for monthly p75, don't average the history), mPulse `statistics`, `histogram`
+buckets, and `summary` are kept in full regardless of mode. A `peak`
+(`{index/x, value/y}`) is added so "when did it spike?" survives downsampling.
 
 **Silent-fallback `warning`.** mPulse answers an unrecognized `timer`/`metric`
 with a *default* (PageLoad) series instead of erroring. When the requested name

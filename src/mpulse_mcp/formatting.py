@@ -4,10 +4,17 @@ Two modes:
 
 * ``raw=True``  -> the mPulse JSON is returned unchanged under ``data``.
 * ``raw=False`` -> a predictable, flat envelope with explicit metadata plus the
-  data body. **Numeric values are never rounded, summarized, or dropped** — the
-  point of this server is to feed exact figures into downstream p75/statistical
-  analysis. Normalization only strips mPulse's presentation envelope and lifts
-  the meaningful arrays into compact, explicitly-keyed structures.
+  data body. Normalization strips mPulse's presentation envelope and lifts the
+  meaningful arrays into compact, explicitly-keyed structures.
+
+**Loss-free is on demand.** Aggregate/period values (``latest``, percentiles,
+histogram buckets) are *never* rounded, summarized, or dropped. But the
+per-minute *time series* (``timers-metrics.history`` / ``by-minute.aPoints``) is
+by default **downsampled** (see ``history_mode``), because the dominant workload
+reads only ``latest`` and full per-minute arrays are ~1,440 points/day of mostly
+unused tokens. The complete series is always recoverable via ``raw=True`` or
+``history_mode='full'``. ``histogram`` buckets (needed for exact p75) and
+``summary`` are treated as aggregates and kept in full regardless of mode.
 
 Every result carries an ``empty`` flag and, for drilldowns, a hint that an
 empty body may mean the dimension combination is unsupported (mPulse returns no
@@ -19,6 +26,18 @@ from __future__ import annotations
 from typing import Any
 
 from .query_types import DRILLDOWN_PARAMS
+
+# --- History (time-series) volume control ----------------------------------
+# 'full'       -> keep every per-minute point (loss-free, largest).
+# 'downsample' -> keep 'latest' + a <=N-point even-spaced series + peak.
+# 'none'       -> drop the series; keep 'latest', endpoints, n_points, peak.
+HISTORY_MODES = ("full", "downsample", "none")
+DEFAULT_HISTORY_MODE = "downsample"
+DOWNSAMPLE_MAX_POINTS = 60
+
+# Only these query-types carry a per-minute time series to reduce. Distribution
+# (histogram) and single-value (summary) shapes are always kept whole.
+_TEMPORAL_QUERY_TYPES = ("timers-metrics", "by-minute")
 
 
 def _period(params: dict[str, Any]) -> dict[str, Any]:
@@ -134,11 +153,20 @@ def normalize(
     aggregation: str,
     data: dict[str, Any],
     raw: bool,
+    history_mode: str = DEFAULT_HISTORY_MODE,
 ) -> dict[str, Any]:
     """Produce the tool's return payload.
 
     ``request_params`` are the wire params actually sent (hyphenated keys).
+
+    ``history_mode`` controls per-minute time-series volume for the temporal
+    query-types (``timers-metrics``, ``by-minute``) — see :data:`HISTORY_MODES`.
+    It is ignored for ``raw=True`` (untouched) and for non-temporal shapes
+    (``summary``/``histogram`` distributions are always kept in full).
     """
+    if history_mode not in HISTORY_MODES:
+        history_mode = DEFAULT_HISTORY_MODE
+
     # Silent-fallback detection is additive metadata (never mutates data), so it
     # applies in raw mode too.
     warning = _detect_silent_fallback(request_params, data)
@@ -158,6 +186,9 @@ def normalize(
     drilldowns = _active_drilldowns(request_params)
     empty = _is_empty(query_type, data)
 
+    body = _apply_history_mode(
+        query_type, _strip_envelope(query_type, data), history_mode
+    )
     envelope: dict[str, Any] = {
         "app": app,
         "query_type": query_type,
@@ -166,8 +197,10 @@ def normalize(
         "aggregation": aggregation,
         "drilldowns": drilldowns,
         "empty": empty,
-        # 'body' holds the loss-free, envelope-stripped data.
-        "body": _strip_envelope(query_type, data),
+        "history_mode": history_mode,
+        # 'body' holds the envelope-stripped data (loss-free when
+        # history_mode='full' or raw=True).
+        "body": body,
     }
     if warning:
         envelope["warning"] = warning
@@ -219,3 +252,101 @@ def _strip_envelope(query_type: str, data: dict[str, Any]) -> dict[str, Any]:
 
     # Unknown shape -> pass through unchanged (never drop data).
     return dict(data)
+
+
+# --- history_mode application ----------------------------------------------
+def _downsample(seq: list[Any], max_points: int = DOWNSAMPLE_MAX_POINTS) -> list[Any]:
+    """Even-spaced downsample preserving the first and last element.
+
+    Returns the input unchanged when it already fits within ``max_points``.
+    """
+    n = len(seq)
+    if n <= max_points:
+        return list(seq)
+    step = (n - 1) / (max_points - 1)
+    idx = sorted({round(i * step) for i in range(max_points)})
+    return [seq[i] for i in idx]
+
+
+def _argmax_numeric(values: list[Any]) -> tuple[int | None, Any]:
+    best_i: int | None = None
+    best_v: Any = None
+    for i, v in enumerate(values):
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            continue
+        if best_v is None or v > best_v:
+            best_i, best_v = i, v
+    return best_i, best_v
+
+
+def _peak_point(points: list[Any]) -> dict[str, Any] | None:
+    """Point with the largest y among {x, y} dicts (spike location)."""
+    best: dict[str, Any] | None = None
+    for p in points:
+        if not isinstance(p, dict):
+            continue
+        y = p.get("y")
+        if isinstance(y, bool) or not isinstance(y, (int, float)):
+            continue
+        if best is None or y > best.get("y"):
+            best = p
+    return dict(best) if best is not None else None
+
+
+def _reduce_tm_series(s: dict[str, Any], mode: str) -> dict[str, Any]:
+    """Reduce a timers-metrics series {id, history:[int], latest}."""
+    if not isinstance(s, dict):
+        return s
+    history = s.get("history")
+    if not isinstance(history, list) or not history:
+        return s
+    out = {k: v for k, v in s.items() if k != "history"}  # keep id, latest, …
+    out["n_points"] = len(history)
+    peak_i, peak_v = _argmax_numeric(history)
+    if peak_i is not None:
+        out["peak"] = {"index": peak_i, "value": peak_v}
+    if mode == "none":
+        out["first"] = history[0]
+        out["last"] = history[-1]
+    else:  # downsample
+        out["history_downsampled"] = _downsample(history)
+    return out
+
+
+def _reduce_bm_series(s: dict[str, Any], mode: str) -> dict[str, Any]:
+    """Reduce a by-minute series {name, aPoints:[{x,y}], statistics, ...}."""
+    if not isinstance(s, dict):
+        return s
+    pts = s.get("aPoints")
+    if not isinstance(pts, list) or not pts:
+        return s
+    out = {k: v for k, v in s.items() if k != "aPoints"}  # keep statistics, …
+    out.setdefault("pointCount", len(pts))
+    peak = _peak_point(pts)
+    if peak is not None:
+        out["peak"] = peak
+    if mode == "none":
+        out["first"] = pts[0]
+        out["last"] = pts[-1]
+    else:  # downsample
+        out["aPoints_downsampled"] = _downsample(pts)
+    return out
+
+
+def _apply_history_mode(
+    query_type: str, body: dict[str, Any], mode: str
+) -> dict[str, Any]:
+    """Apply the time-series volume policy to a stripped body.
+
+    No-op for ``mode='full'`` and for non-temporal query-types (their aggregate
+    data must never be reduced). Always preserves ``latest``/statistics.
+    """
+    if mode == "full" or query_type not in _TEMPORAL_QUERY_TYPES:
+        return body
+    series = body.get("series")
+    if not isinstance(series, list):
+        return body
+    reducer = _reduce_tm_series if query_type == "timers-metrics" else _reduce_bm_series
+    body = dict(body)
+    body["series"] = [reducer(s, mode) for s in series]
+    return body

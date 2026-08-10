@@ -81,7 +81,7 @@ def test_summary_values_preserved_exactly() -> None:
     assert out["body"] == data
 
 
-def test_timers_metrics_history_preserved() -> None:
+def test_timers_metrics_history_preserved_in_full_mode() -> None:
     history = list(range(1440))  # a full day, per-minute
     data = {
         "dataTimeZone": "UTC",
@@ -94,12 +94,15 @@ def test_timers_metrics_history_preserved() -> None:
         aggregation="per-minute",
         data=data,
         raw=False,
+        history_mode="full",
     )
+    # full mode is loss-free: every point preserved, byte-for-byte.
     assert out["body"]["series"][0]["history"] == history
+    assert out["history_mode"] == "full"
     assert out["empty"] is False
 
 
-def test_series_envelope_stripped_but_points_kept() -> None:
+def test_series_envelope_stripped_but_points_kept_in_full_mode() -> None:
     data = {
         "chartTitle": "PageLoad",
         "datasetName": "ds",
@@ -112,9 +115,99 @@ def test_series_envelope_stripped_but_points_kept() -> None:
         aggregation="per-minute",
         data=data,
         raw=False,
+        history_mode="full",
     )
     assert out["body"]["meta"]["chartTitle"] == "PageLoad"
     assert out["body"]["series"][0]["aPoints"] == [{"x": 0, "y": 100}]
+
+
+# --- history_mode ----------------------------------------------------------
+def _tm_day(peak_at: int = 800, peak_val: int = 9999) -> dict:
+    history = list(range(1440))
+    history[peak_at] = peak_val
+    return {
+        "dataTimeZone": "UTC",
+        "values": [{"id": "PageLoad", "history": history, "latest": 3441}],
+    }
+
+
+def test_downsample_is_default_and_shrinks_history() -> None:
+    out = normalize(
+        app="alpha",
+        query_type="timers-metrics",
+        request_params={"date-comparator": "Last24Hours"},
+        aggregation="per-minute",
+        data=_tm_day(),
+        raw=False,  # no history_mode -> default
+    )
+    s = out["body"]["series"][0]
+    assert out["history_mode"] == "downsample"
+    assert s["latest"] == 3441  # aggregate always preserved
+    assert s["n_points"] == 1440
+    assert "history" not in s
+    assert len(s["history_downsampled"]) <= 60
+    assert s["peak"] == {"index": 800, "value": 9999}  # spike location kept
+
+
+def test_none_mode_drops_series_keeps_aggregates() -> None:
+    out = normalize(
+        app="alpha",
+        query_type="timers-metrics",
+        request_params={"date-comparator": "Last24Hours"},
+        aggregation="per-minute",
+        data=_tm_day(),
+        raw=False,
+        history_mode="none",
+    )
+    s = out["body"]["series"][0]
+    assert "history" not in s and "history_downsampled" not in s
+    assert s["latest"] == 3441
+    assert s["n_points"] == 1440
+    assert s["first"] == 0 and s["last"] == 1439
+    assert s["peak"]["value"] == 9999
+
+
+def test_by_minute_downsample_keeps_statistics_and_peak() -> None:
+    pts = [{"x": i, "y": i} for i in range(1440)]
+    pts[500]["y"] = 8888
+    data = {
+        "series": {
+            "series": [
+                {"name": "PageLoad", "aPoints": pts, "pointCount": 1440,
+                 "statistics": {"yMin": 0, "yMax": 8888, "ySum": 1, "yAvg": 1}}
+            ]
+        }
+    }
+    out = normalize(
+        app="alpha",
+        query_type="by-minute",
+        request_params={"date": "2026-08-03"},
+        aggregation="per-minute",
+        data=data,
+        raw=False,
+    )
+    s = out["body"]["series"][0]
+    assert "aPoints" not in s
+    assert len(s["aPoints_downsampled"]) <= 60
+    assert s["statistics"]["yMax"] == 8888  # mPulse aggregates untouched
+    assert s["peak"]["y"] == 8888
+
+
+def test_histogram_never_reduced_even_at_none() -> None:
+    # histogram buckets are a distribution (needed for exact p75), not a time
+    # series -> must survive any history_mode intact.
+    buckets = [{"s": i, "e": i + 1, "c": i} for i in range(200)]
+    data = {"series": {"series": [{"name": "PageLoad", "aPoints": buckets}]}}
+    out = normalize(
+        app="alpha",
+        query_type="histogram",
+        request_params={"date": "2026-08-03"},
+        aggregation="per-bucket",
+        data=data,
+        raw=False,
+        history_mode="none",
+    )
+    assert out["body"]["series"][0]["aPoints"] == buckets
 
 
 def test_raw_passthrough_is_untouched() -> None:
