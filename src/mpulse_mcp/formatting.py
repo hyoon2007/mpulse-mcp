@@ -154,6 +154,7 @@ def normalize(
     data: dict[str, Any],
     raw: bool,
     history_mode: str = DEFAULT_HISTORY_MODE,
+    limit: int | None = None,
 ) -> dict[str, Any]:
     """Produce the tool's return payload.
 
@@ -163,6 +164,10 @@ def normalize(
     query-types (``timers-metrics``, ``by-minute``) — see :data:`HISTORY_MODES`.
     It is ignored for ``raw=True`` (untouched) and for non-temporal shapes
     (``summary``/``histogram`` distributions are always kept in full).
+
+    ``limit`` caps the largest top-level list in the body (high-cardinality
+    query-types like ``dimension-values``/``geography``), recording a
+    ``truncated`` note. ``None`` means no cap; ignored for ``raw=True``.
     """
     if history_mode not in HISTORY_MODES:
         history_mode = DEFAULT_HISTORY_MODE
@@ -189,6 +194,8 @@ def normalize(
     body = _apply_history_mode(
         query_type, _strip_envelope(query_type, data), history_mode
     )
+    truncation = _apply_limit(body, limit)
+
     envelope: dict[str, Any] = {
         "app": app,
         "query_type": query_type,
@@ -204,15 +211,67 @@ def normalize(
     }
     if warning:
         envelope["warning"] = warning
-    if empty and drilldowns:
-        envelope["note"] = (
-            "Empty result. This drilldown combination may not be supported by "
-            "mPulse (unsupported combinations return no data rather than an "
-            "error). Verify the dimensions individually."
-        )
-    elif empty:
-        envelope["note"] = "Empty result: no data for this query/period."
+    if truncation:
+        envelope["truncated"] = truncation
+    if empty:
+        reason, note = _classify_empty(drilldowns)
+        envelope["empty_reason"] = reason
+        envelope["note"] = note
     return envelope
+
+
+def _classify_empty(drilldowns: dict[str, Any]) -> tuple[str, str]:
+    """Heuristically explain an empty result (cheap, no extra network call).
+
+    mPulse returns *no data* rather than an error for an unsupported dimension
+    combination, which is indistinguishable from genuine no-traffic without a
+    probe. Single-dimension filters are generally supported, so one drilldown is
+    most likely no-traffic; multiple drilldowns raise the chance of an
+    unsupported combination. Callers can pass ``probe=true`` for a definitive
+    answer (one extra query without the drilldowns).
+    """
+    n = len(drilldowns)
+    if n == 0:
+        return "no_data", "Empty result: no data for this query/period."
+    if n == 1:
+        return (
+            "likely_no_traffic",
+            "Empty result with a single drilldown. Single-dimension filters are "
+            "generally supported, so this most likely means no matching traffic "
+            "— not an unsupported combination. Pass probe=true to confirm.",
+        )
+    return (
+        "possibly_unsupported_combo",
+        "Empty result with multiple drilldowns. mPulse returns no data (not an "
+        "error) for unsupported dimension combinations, so this may be an "
+        "unsupported combo OR simply no matching traffic. Pass probe=true to "
+        "disambiguate, or test the dimensions individually.",
+    )
+
+
+def _apply_limit(body: dict[str, Any], limit: int | None) -> dict[str, Any] | None:
+    """Truncate the largest top-level list in ``body`` to ``limit`` items.
+
+    Returns truncation metadata ``{key, total, returned}`` when it trims
+    something, else ``None``. Mutates ``body`` in place (the list value is
+    replaced by its prefix). Non-list bodies and ``limit is None`` are no-ops.
+    This is shape-agnostic on purpose: the high-cardinality query-types
+    (dimension-values, geography, page-groups, …) have differing keys, but each
+    puts its rows in one dominant list.
+    """
+    if limit is None or limit < 0 or not isinstance(body, dict):
+        return None
+    # Pick the longest top-level list value as the "rows" to cap.
+    key = None
+    longest = -1
+    for k, v in body.items():
+        if isinstance(v, list) and len(v) > longest:
+            key, longest = k, len(v)
+    if key is None or longest <= limit:
+        return None
+    total = longest
+    body[key] = body[key][:limit]
+    return {"key": key, "total": total, "returned": limit}
 
 
 def _strip_envelope(query_type: str, data: dict[str, Any]) -> dict[str, Any]:

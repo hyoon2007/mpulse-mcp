@@ -230,6 +230,19 @@ metadata and appears in `raw` mode too (data stays untouched).
 `payload app=… query=… bytes=… points=…` to **stderr**, for measuring response
 size / token cost (e.g. before/after future history-reduction work).
 
+**`limit` — high-cardinality caps.** `dimension-values`, `geography`,
+`page-groups`, `browsers`, … can return hundreds of rows. On the `query` tool
+these query-types are capped at 100 by default (pass an explicit `limit` to
+change it); when trimmed, the result carries `truncated: {key, total, returned}`
+so nothing silently disappears. `raw=true` is never trimmed.
+
+**`empty_reason` + `probe` — why is it empty?** An unsupported drilldown
+combination and genuine no-traffic both come back empty. Every empty result now
+carries an `empty_reason` heuristic (`no_data` / `likely_no_traffic` /
+`possibly_unsupported_combo`) at zero cost. Pass `probe=true` (on the explicit
+tools or `query`) to spend **one** extra drilldown-free query and get a
+definitive `unsupported_combo` vs `no_traffic`, reported in a `probe` block.
+
 ### Batch aggregate
 
 `get_aggregate` runs a matrix of `timers-metrics` queries and returns only each

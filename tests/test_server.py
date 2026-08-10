@@ -220,3 +220,80 @@ async def test_get_aggregate_autocorrects_metric(wired_client) -> None:
         await wired_client.aclose()
     assert "corrections" in result
     assert route.calls.last.request.url.params["metric"] == "Beacons"
+
+
+# --- limit (#4) ------------------------------------------------------------
+@respx.mock
+async def test_query_caps_high_cardinality_by_default(wired_client) -> None:
+    respx.put(TOKENS_URL).mock(return_value=httpx.Response(201, json={"token": "T"}))
+    respx.get(_q_url("KEY-ALPHA", "geography")).mock(
+        return_value=httpx.Response(200, json=[{"c": i} for i in range(150)])
+    )
+    try:
+        result = await server.query(
+            query_type="geography", params={"date-comparator": "LastHour"}
+        )
+    finally:
+        await wired_client.aclose()
+    # geography is high-cardinality -> auto-capped at 100 with a truncation note.
+    assert result["truncated"]["total"] == 150
+    assert result["truncated"]["returned"] == 100
+
+
+# --- probe / empty_reason (#5) ---------------------------------------------
+def _summary_drilldown_probe(request: httpx.Request):
+    """Empty when drilled down (page-group present), data at the base."""
+    if "page-group" in request.url.params:
+        return httpx.Response(200, json={"n": "0"})
+    return httpx.Response(200, json={"n": "100", "median": "1200"})
+
+
+@respx.mock
+async def test_probe_detects_unsupported_combo(wired_client) -> None:
+    respx.put(TOKENS_URL).mock(return_value=httpx.Response(201, json={"token": "T"}))
+    respx.get(_q_url("KEY-ALPHA", "summary")).mock(
+        side_effect=_summary_drilldown_probe
+    )
+    try:
+        result = await server._run(
+            app=None,
+            query_type="summary",
+            value_params={"timer": "PageLoad"},
+            date="2026-08-03",
+            date_comparator=None,
+            timezone=None,
+            drilldowns={"page-group": "Home", "browser": "X"},
+            aggregation="single-value",
+            raw=False,
+            probe=True,
+        )
+    finally:
+        await wired_client.aclose()
+    assert result["empty"] is True
+    assert result["empty_reason"] == "unsupported_combo"
+    assert result["probe"] == {"ran": True, "base_empty": False}
+
+
+@respx.mock
+async def test_probe_detects_no_traffic(wired_client) -> None:
+    respx.put(TOKENS_URL).mock(return_value=httpx.Response(201, json={"token": "T"}))
+    respx.get(_q_url("KEY-ALPHA", "summary")).mock(
+        return_value=httpx.Response(200, json={"n": "0"})  # empty everywhere
+    )
+    try:
+        result = await server._run(
+            app=None,
+            query_type="summary",
+            value_params={"timer": "PageLoad"},
+            date="2026-08-03",
+            date_comparator=None,
+            timezone=None,
+            drilldowns={"page-group": "Home", "browser": "X"},
+            aggregation="single-value",
+            raw=False,
+            probe=True,
+        )
+    finally:
+        await wired_client.aclose()
+    assert result["empty_reason"] == "no_traffic"
+    assert result["probe"] == {"ran": True, "base_empty": True}

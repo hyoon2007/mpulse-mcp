@@ -19,6 +19,7 @@ from .client import MpulseClient
 from .config import Registry, load_registry
 from .errors import MpulseError, ValidationError
 from .query_types import (
+    DRILLDOWN_PARAMS,
     KNOWN_DATE_COMPARATORS,
     QUERY_TYPES,
     describe as describe_qt,
@@ -141,6 +142,7 @@ async def _run(
     aggregation: str,
     raw: bool,
     history_mode: str = "downsample",
+    probe: bool = False,
 ) -> dict[str, Any]:
     """Shared execution path for the explicit tools.
 
@@ -177,7 +179,70 @@ async def _run(
     )
     if corrections:
         result["corrections"] = corrections
+    if probe:
+        await _probe_empty_reason(client, app, query_type, params, result)
     return result
+
+
+# High-cardinality query-types are capped by default so a value dump can't blow
+# the token budget; callers can override with an explicit `limit`.
+_HIGH_CARDINALITY_QUERY_TYPES = frozenset(
+    {
+        "dimension-values",
+        "dimension-over-time",
+        "dimensions-over-time",
+        "metrics-by-dimension",
+        "geography",
+        "page-groups",
+        "browsers",
+        "ab-tests",
+        "bandwidth",
+    }
+)
+_DEFAULT_HIGH_CARDINALITY_LIMIT = 100
+
+
+async def _probe_empty_reason(
+    client: MpulseClient,
+    app: str | None,
+    query_type: str,
+    params: dict[str, Any],
+    result: dict[str, Any],
+) -> None:
+    """Disambiguate an empty drilldown result with one extra drilldown-free query.
+
+    Opt-in (a network call). Only runs when ``result`` is a non-raw empty
+    envelope that had drilldowns. Sets ``empty_reason`` to ``unsupported_combo``
+    (the same query without drilldowns has data) or ``no_traffic`` (still empty),
+    and records a ``probe`` block. Failures are reported, never raised.
+    """
+    from .formatting import _is_empty
+
+    if not isinstance(result, dict) or not result.get("empty"):
+        return
+    if not result.get("drilldowns"):
+        return
+
+    base = {
+        k: v
+        for k, v in params.items()
+        if k not in DRILLDOWN_PARAMS and not k.startswith("custom-dimension-")
+    }
+    try:
+        base_data = await client.query(app=app, query_type=query_type, params=base)
+    except MpulseError as exc:
+        result["probe"] = {"ran": False, "error": exc.user_message()}
+        return
+
+    base_empty = _is_empty(query_type, base_data)
+    result["empty_reason"] = "no_traffic" if base_empty else "unsupported_combo"
+    result["probe"] = {"ran": True, "base_empty": base_empty}
+    result["note"] = (
+        "Probe: same query without drilldowns is "
+        + ("also empty → no matching traffic."
+           if base_empty
+           else "non-empty → the drilldown combination is unsupported.")
+    )
 
 
 def _resolve_value_names(query_type: str, params: dict[str, Any]) -> list[str]:
@@ -235,6 +300,7 @@ async def get_summary(
     connection_type: str | None = None,
     beacon_type: str | None = None,
     raw: bool = False,
+    probe: bool = False,
 ) -> dict[str, Any]:
     """Aggregate summary stats for one timer (median, margin-of-error, count, p95, p98).
 
@@ -251,7 +317,9 @@ async def get_summary(
 
     Drilldowns filter the data (e.g. `page_group`, `browser`, `country`,
     `device_type`, `ab_test`). Unsupported combinations return empty data with a
-    note rather than an error.
+    note rather than an error; an `empty_reason` heuristic labels the likely
+    cause, and `probe=True` runs one extra drilldown-free query to decide
+    `unsupported_combo` vs `no_traffic` definitively.
 
     Set `raw=True` to get mPulse's untouched JSON. Numeric values are never
     rounded or summarized.
@@ -283,6 +351,7 @@ async def get_summary(
         ),
         aggregation="single-value (period aggregate)",
         raw=raw,
+        probe=probe,
     )
 
 
@@ -302,6 +371,7 @@ async def get_histogram(
     device_type: str | None = None,
     beacon_type: str | None = None,
     raw: bool = False,
+    probe: bool = False,
 ) -> dict[str, Any]:
     """Distribution (histogram buckets) for one timer over the period.
 
@@ -335,6 +405,7 @@ async def get_histogram(
         ),
         aggregation="per-bucket distribution",
         raw=raw,
+        probe=probe,
     )
 
 
@@ -355,6 +426,7 @@ async def get_timers(
     beacon_type: str | None = None,
     raw: bool = False,
     history_mode: str = "downsample",
+    probe: bool = False,
 ) -> dict[str, Any]:
     """A single timer's value **by minute over time** (time series).
 
@@ -392,6 +464,7 @@ async def get_timers(
         aggregation="per-minute",
         raw=raw,
         history_mode=history_mode,
+        probe=probe,
     )
 
 
@@ -413,6 +486,7 @@ async def get_metrics(
     beacon_type: str | None = None,
     raw: bool = False,
     history_mode: str = "downsample",
+    probe: bool = False,
 ) -> dict[str, Any]:
     """Multiple timers/metrics **by minute over time**.
 
@@ -451,6 +525,7 @@ async def get_metrics(
         aggregation="per-minute",
         raw=raw,
         history_mode=history_mode,
+        probe=probe,
     )
 
 
@@ -464,6 +539,8 @@ async def query(
     params: dict[str, Any] | None = None,
     raw: bool = False,
     history_mode: str = "downsample",
+    limit: int | None = None,
+    probe: bool = False,
 ) -> dict[str, Any]:
     """Call an arbitrary mPulse query-type with arbitrary parameters.
 
@@ -478,6 +555,16 @@ async def query(
 
     `history_mode` (`downsample`/`none`/`full`) only affects the temporal
     query-types `timers-metrics` and `by-minute`; other query-types ignore it.
+
+    `limit` caps the returned rows for high-cardinality query-types (a
+    `truncated` note reports the total). High-cardinality types
+    (`dimension-values`, `geography`, `page-groups`, `browsers`, …) are capped at
+    100 by default; pass an explicit `limit` (or a large one) to change this.
+
+    `probe=True`: if the result is empty *and* had drilldowns, run one extra
+    query without the drilldowns to decide `empty_reason`
+    (`unsupported_combo` vs `no_traffic`).
+
     `raw=True` returns mPulse's untouched JSON.
     """
     from .formatting import normalize
@@ -492,6 +579,10 @@ async def query(
             "message": "Provide either 'date' or 'date-comparator', not both.",
         }
 
+    effective_limit = limit
+    if effective_limit is None and query_type in _HIGH_CARDINALITY_QUERY_TYPES:
+        effective_limit = _DEFAULT_HIGH_CARDINALITY_LIMIT
+
     client = _get_client()
     app_name = app or client.registry.default_app
     try:
@@ -500,7 +591,7 @@ async def query(
         return {"error": type(exc).__name__, "message": exc.user_message()}
 
     wire.setdefault("format", "json")
-    return normalize(
+    result = normalize(
         app=app_name,
         query_type=query_type,
         request_params=wire,
@@ -508,7 +599,11 @@ async def query(
         data=data,
         raw=raw,
         history_mode=history_mode,
+        limit=effective_limit,
     )
+    if probe:
+        await _probe_empty_reason(client, app, query_type, wire, result)
+    return result
 
 
 # ===========================================================================
