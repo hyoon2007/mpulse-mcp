@@ -139,6 +139,7 @@ async def _run(
     drilldowns: dict[str, Any],
     aggregation: str,
     raw: bool,
+    history_mode: str = "downsample",
 ) -> dict[str, Any]:
     """Shared execution path for the explicit tools.
 
@@ -169,6 +170,7 @@ async def _run(
         aggregation=aggregation,
         data=data,
         raw=raw,
+        history_mode=history_mode,
     )
 
 
@@ -314,6 +316,7 @@ async def get_timers(
     device_type: str | None = None,
     beacon_type: str | None = None,
     raw: bool = False,
+    history_mode: str = "downsample",
 ) -> dict[str, Any]:
     """A single timer's value **by minute over time** (time series).
 
@@ -321,8 +324,11 @@ async def get_timers(
     default `PageLoad`, or a `custom_timer`). For *multiple* timers/metrics at
     once, use `get_metrics` (query-type `timers-metrics`).
 
-    Returns a series of {x, y} points at per-minute resolution for the selected
-    calendar day (or `date_comparator` window). Values are preserved exactly.
+    Returns a per-minute series for the selected calendar day (or
+    `date_comparator` window). `history_mode` controls series volume:
+    `downsample` (default, ≤60 points + `peak` + `statistics`), `none` (drop the
+    series, keep endpoints/`peak`/`statistics`), or `full` (every minute,
+    loss-free). Use `full` or `raw=True` when you need exact per-minute values.
     """
     return await _run(
         app=app,
@@ -347,6 +353,7 @@ async def get_timers(
         ),
         aggregation="per-minute",
         raw=raw,
+        history_mode=history_mode,
     )
 
 
@@ -367,15 +374,19 @@ async def get_metrics(
     device_type: str | None = None,
     beacon_type: str | None = None,
     raw: bool = False,
+    history_mode: str = "downsample",
 ) -> dict[str, Any]:
     """Multiple timers/metrics **by minute over time**.
 
     mPulse query-type: `timers-metrics`. `metric` defaults to `Beacons`, `timer`
-    to `PageLoad`. Returns `values:[{id, history:[...per-minute...], latest}]`
-    plus the data timezone.
+    to `PageLoad`. Returns `series:[{id, latest, ...}]` plus the data timezone;
+    `latest` is the period-wide aggregate (e.g. monthly p75 — read this, do NOT
+    average the per-minute history).
 
-    Time selection and drilldowns behave as in the other tools (single calendar
-    day OR relative `date_comparator`). Numbers are preserved losslessly.
+    `history_mode` controls per-minute volume: `downsample` (default, `latest` +
+    ≤60-point `history_downsampled` + `peak`), `none` (just `latest`, endpoints,
+    `peak`, `n_points`), or `full` (every minute, loss-free). `latest` is always
+    preserved. Use `full` or `raw=True` for exact per-minute values.
     """
     return await _run(
         app=app,
@@ -401,6 +412,7 @@ async def get_metrics(
         ),
         aggregation="per-minute",
         raw=raw,
+        history_mode=history_mode,
     )
 
 
@@ -413,6 +425,7 @@ async def query(
     app: str | None = None,
     params: dict[str, Any] | None = None,
     raw: bool = False,
+    history_mode: str = "downsample",
 ) -> dict[str, Any]:
     """Call an arbitrary mPulse query-type with arbitrary parameters.
 
@@ -425,6 +438,8 @@ async def query(
     "PageLoad"}`. `format=json` is added automatically. Remember the one-
     calendar-day-per-query constraint.
 
+    `history_mode` (`downsample`/`none`/`full`) only affects the temporal
+    query-types `timers-metrics` and `by-minute`; other query-types ignore it.
     `raw=True` returns mPulse's untouched JSON.
     """
     from .formatting import normalize
@@ -454,6 +469,7 @@ async def query(
         aggregation="unspecified",
         data=data,
         raw=raw,
+        history_mode=history_mode,
     )
 
 
