@@ -182,6 +182,18 @@ query-type with wire-name params, for cases the explicit tools don't cover.
   when an unsupported drilldown combination is the likely cause.
 - `raw=true`: mPulse's untouched JSON under `data`.
 
+**Silent-fallback `warning`.** mPulse answers an unrecognized `timer`/`metric`
+with a *default* (PageLoad) series instead of erroring. When the requested name
+does not match the series id/name echoed in the response, the result carries a
+`warning` field so the caller knows the data is **not** for the requested name.
+Casing/separator-only differences (`largest_contentful_paint` vs
+`LargestContentfulPaint`) are treated as a match and never warn. The `warning`
+is additive metadata and appears in `raw` mode too (data stays untouched).
+
+**Payload instrumentation.** Every successful query logs
+`payload app=… query=… bytes=… points=…` to **stderr**, for measuring response
+size / token cost (e.g. before/after future history-reduction work).
+
 ### Constraints surfaced to the model
 
 One calendar day per query (ranges are rejected with guidance to split into

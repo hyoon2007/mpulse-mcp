@@ -46,6 +46,59 @@ def _active_drilldowns(params: dict[str, Any]) -> dict[str, Any]:
     return dd
 
 
+def _norm_name(name: str) -> str:
+    """Casing/separator-insensitive key: 'largest_contentful_paint' == 'LargestContentfulPaint'."""
+    return "".join(ch for ch in name.lower() if ch.isalnum())
+
+
+def _returned_series_ids(data: dict[str, Any]) -> list[str]:
+    """Series identifiers echoed by mPulse, across the id/name-bearing shapes."""
+    ids: list[str] = []
+    values = data.get("values")
+    if isinstance(values, list):
+        ids += [v["id"] for v in values if isinstance(v, dict) and v.get("id")]
+    series = data.get("series")
+    if isinstance(series, dict) and isinstance(series.get("series"), list):
+        ids += [
+            s["name"] for s in series["series"] if isinstance(s, dict) and s.get("name")
+        ]
+    return ids
+
+
+def _detect_silent_fallback(
+    request_params: dict[str, Any], data: dict[str, Any]
+) -> str | None:
+    """Warn when a requested built-in timer/metric was silently replaced.
+
+    mPulse answers an unrecognized ``timer``/``metric`` with a PageLoad (or
+    default) series instead of erroring. We compare the requested name against
+    the series id/name echoed in the response; a casing/separator-only
+    difference is treated as a match (same metric), so only a genuinely
+    different id triggers the warning. Custom timers/dimensions are not checked
+    (their echoed id may legitimately differ from the param value).
+    """
+    returned = _returned_series_ids(data)
+    if not returned:  # summary/flat/empty shapes carry no id to compare
+        return None
+    returned_norm = {_norm_name(r) for r in returned}
+
+    missing: list[str] = []
+    for key in ("timer", "metric"):
+        requested = request_params.get(key)
+        if isinstance(requested, str) and requested:
+            if _norm_name(requested) not in returned_norm:
+                missing.append(requested)
+    if not missing:
+        return None
+    return (
+        f"Requested {', '.join(repr(m) for m in missing)} but mPulse returned "
+        f"series {returned!r} — likely a SILENT FALLBACK to a default "
+        f"(unrecognized timer/metric names are not rejected). Verify the exact "
+        f"name via describe_query; the returned data is NOT for the requested "
+        f"name."
+    )
+
+
 def _is_empty(query_type: str, data: dict[str, Any]) -> bool:
     """Best-effort emptiness detection across the known response shapes."""
     if not data:
@@ -86,13 +139,20 @@ def normalize(
 
     ``request_params`` are the wire params actually sent (hyphenated keys).
     """
+    # Silent-fallback detection is additive metadata (never mutates data), so it
+    # applies in raw mode too.
+    warning = _detect_silent_fallback(request_params, data)
+
     if raw:
-        return {
+        out: dict[str, Any] = {
             "app": app,
             "query_type": query_type,
             "raw": True,
             "data": data,
         }
+        if warning:
+            out["warning"] = warning
+        return out
 
     period = _period(request_params)
     drilldowns = _active_drilldowns(request_params)
@@ -109,6 +169,8 @@ def normalize(
         # 'body' holds the loss-free, envelope-stripped data.
         "body": _strip_envelope(query_type, data),
     }
+    if warning:
+        envelope["warning"] = warning
     if empty and drilldowns:
         envelope["note"] = (
             "Empty result. This drilldown combination may not be supported by "

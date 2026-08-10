@@ -146,7 +146,9 @@ class MpulseClient:
                 continue
             if resp.status_code // 100 != 2:
                 raise map_query_status(resp.status_code, resp.text)
-            return _parse_json(resp)
+            data = _parse_json(resp)
+            _log_payload_stats(app_cfg.name, query_type, resp, data)
+            return data
 
         # Both auth attempts returned 401.
         raise AuthError(
@@ -217,6 +219,53 @@ class MpulseClient:
             f"Request to mPulse failed after {MAX_RETRIES + 1} attempts: {last_exc}",
             hint="Check network connectivity to mpulse.soasta.com.",
         )
+
+
+def _count_points(data: dict) -> int:
+    """Best-effort count of numeric data points across known response shapes.
+
+    Used only for instrumentation, so an unrecognized shape returns 0 rather
+    than raising.
+    """
+    # timers-metrics: values:[{history:[...]}]
+    values = data.get("values")
+    if isinstance(values, list):
+        return sum(
+            len(v.get("history", []))
+            for v in values
+            if isinstance(v, dict) and isinstance(v.get("history"), list)
+        )
+    # series-based (histogram / by-minute): series:{series:[{aPoints|buckets}]}
+    series = data.get("series")
+    if isinstance(series, dict) and isinstance(series.get("series"), list):
+        total = 0
+        for s in series["series"]:
+            if not isinstance(s, dict):
+                continue
+            for key in ("aPoints", "buckets"):
+                pts = s.get(key)
+                if isinstance(pts, list):
+                    total += len(pts)
+        return total
+    return 0
+
+
+def _log_payload_stats(
+    app: str, query_type: str, resp: httpx.Response, data: dict
+) -> None:
+    """Log response size + point count to stderr for token-cost visibility."""
+    try:
+        n_bytes = len(resp.content)
+    except Exception:
+        n_bytes = -1
+    n_points = _count_points(data)
+    log.info(
+        "payload app=%s query=%s bytes=%d points=%d",
+        app,
+        query_type,
+        n_bytes,
+        n_points,
+    )
 
 
 def _clean_params(params: dict[str, object]) -> dict[str, str]:

@@ -7,7 +7,7 @@ import pytest
 import respx
 
 from mpulse_mcp.auth import TOKENS_PATH
-from mpulse_mcp.client import AUTH_HEADER, MpulseClient
+from mpulse_mcp.client import AUTH_HEADER, MpulseClient, _count_points
 from mpulse_mcp.config import Registry
 from mpulse_mcp.errors import LiteAccountError, RateLimitError
 
@@ -21,6 +21,48 @@ def _q_url(api_key: str, qt: str) -> str:
 
 def _mint(token: str = "SEC") -> None:
     respx.put(TOKENS_URL).mock(return_value=httpx.Response(201, json={"token": token}))
+
+
+# --- instrumentation -------------------------------------------------------
+def test_count_points_timers_metrics() -> None:
+    data = {"values": [{"id": "A", "history": [1, 2, 3]}, {"id": "B", "history": [4]}]}
+    assert _count_points(data) == 4
+
+
+def test_count_points_series_shape() -> None:
+    data = {"series": {"series": [{"name": "X", "aPoints": [1, 2]}, {"name": "Y", "buckets": [3, 4, 5]}]}}
+    assert _count_points(data) == 5
+
+
+def test_count_points_unknown_shape_is_zero() -> None:
+    assert _count_points({"median": "1"}) == 0
+
+
+@respx.mock
+async def test_query_logs_payload_stats(
+    registry: Registry, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    _mint()
+    respx.get(_q_url("KEY-ALPHA", "timers-metrics")).mock(
+        return_value=httpx.Response(
+            200, json={"values": [{"id": "PageLoad", "history": [1, 2, 3], "latest": 3}]}
+        )
+    )
+    client = MpulseClient(registry, http=httpx.AsyncClient(base_url=BASE))
+    try:
+        with caplog.at_level(logging.INFO, logger="mpulse_mcp"):
+            await client.query(
+                app="alpha", query_type="timers-metrics",
+                params={"date_comparator": "LastHour"},
+            )
+    finally:
+        await client.aclose()
+    stats = [r.getMessage() for r in caplog.records if "payload" in r.getMessage()]
+    assert stats, "expected a payload stats log line"
+    assert "points=3" in stats[0]
+    assert "query=timers-metrics" in stats[0]
 
 
 @respx.mock
