@@ -2,14 +2,22 @@
   "default_app": "app-a",
   "tenant": "your-tenant",
   "api_token_env": "MPULSE_API_TOKEN",
+  "custom_dimensions": {
+    "branch": { "display": "Branch", "description": "Shared custom dimension (inherited by every app)" }
+  },
   "apps": {
     "app-a": {
-      "api_key": "XXXXX-XXXXX-XXXXX-XXXXX-XXXXX"
+      "api_key": "XXXXX-XXXXX-XXXXX-XXXXX-XXXXX",
+      "custom_dimensions": {
+        "mobile_speed": { "display": "mobile speed", "description": "navigator.connection.effectiveType" },
+        "campaign": {}
+      }
     },
     "app-b": {
       "api_key": "YYYYY-YYYYY-YYYYY-YYYYY-YYYYY",
       "tenant": "override-if-different",
-      "api_token_env": "MPULSE_API_TOKEN_APP_B"
+      "api_token_env": "MPULSE_API_TOKEN_APP_B",
+      "custom_dimensions": ["checkout_step"]
     }
   }
 }
