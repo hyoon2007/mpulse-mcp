@@ -63,6 +63,10 @@ class AppConfig:
     api_key: str
     tenant: str | None
     api_token_env: str
+    # Custom dimensions defined for this app, keyed by the mPulse *wire label*
+    # (lowercased, spaces -> underscores). mPulse has no API to list these, so
+    # they are declared here purely as hints (never used to hard-reject).
+    custom_dimensions: dict[str, dict] = field(default_factory=dict)
 
     def credential_key(self) -> tuple[str | None, str]:
         """Identity of the credential used to mint tokens.
@@ -127,6 +131,45 @@ def _locate_config_path() -> Path:
     )
 
 
+def custom_dimension_wire_label(name: str) -> str:
+    """mPulse's label rule: lowercase, spaces -> underscores. 'mobile speed' -> 'mobile_speed'."""
+    return name.strip().lower().replace(" ", "_")
+
+
+def _normalize_custom_dimensions(raw: object, where: str) -> dict[str, dict]:
+    """Validate a ``custom_dimensions`` block into ``{wire_label: {meta}}``.
+
+    Accepts either a list of names or an object keyed by name; each value may be
+    null or an object (e.g. ``{"display": ..., "description": ...}``). Keys are
+    normalized to the mPulse wire label. A missing block yields ``{}``.
+    """
+    if raw is None:
+        return {}
+    out: dict[str, dict] = {}
+    if isinstance(raw, list):
+        items: list[tuple[str, dict]] = [(str(n), {}) for n in raw]
+    elif isinstance(raw, dict):
+        items = []
+        for n, meta in raw.items():
+            if meta is None:
+                meta = {}
+            if not isinstance(meta, dict):
+                raise ConfigError(
+                    f"custom_dimensions['{n}'] in {where} must be an object or null."
+                )
+            items = items + [(str(n), meta)]
+    else:
+        raise ConfigError(
+            f"'custom_dimensions' in {where} must be a list or object."
+        )
+    for name, meta in items:
+        label = custom_dimension_wire_label(name)
+        entry = dict(meta)
+        entry.setdefault("display", name)
+        out[label] = entry
+    return out
+
+
 def load_registry(path: str | os.PathLike[str] | None = None) -> Registry:
     """Load and validate the apps registry.
 
@@ -149,6 +192,7 @@ def load_registry(path: str | os.PathLike[str] | None = None) -> Registry:
 
     top_tenant = raw.get("tenant")
     top_token_env = raw.get("api_token_env", "MPULSE_API_TOKEN")
+    top_custom_dims = _normalize_custom_dimensions(raw.get("custom_dimensions"), "<top-level>")
 
     apps: dict[str, AppConfig] = {}
     for name, entry in apps_raw.items():
@@ -157,11 +201,17 @@ def load_registry(path: str | os.PathLike[str] | None = None) -> Registry:
         api_key = entry.get("api_key")
         if not api_key or not isinstance(api_key, str):
             raise ConfigError(f"App '{name}' is missing a string 'api_key'.")
+        # Top-level custom dimensions are shared defaults; app-level ones extend
+        # or override them (merge, app wins).
+        app_custom_dims = _normalize_custom_dimensions(
+            entry.get("custom_dimensions"), name
+        )
         apps[name] = AppConfig(
             name=name,
             api_key=api_key,
             tenant=entry.get("tenant", top_tenant),
             api_token_env=entry.get("api_token_env", top_token_env),
+            custom_dimensions={**top_custom_dims, **app_custom_dims},
         )
 
     default_app = raw.get("default_app")
@@ -188,10 +238,11 @@ def load_registry(path: str | os.PathLike[str] | None = None) -> Registry:
     )
     for a in apps.values():
         log.info(
-            "  app '%s' api_key=%s tenant=%s token_env=%s",
+            "  app '%s' api_key=%s tenant=%s token_env=%s custom_dims=%d",
             a.name,
             mask(a.api_key),
             a.tenant or "<top-level/none>",
             a.api_token_env,
+            len(a.custom_dimensions),
         )
     return Registry(default_app=default_app, apps=apps)

@@ -111,6 +111,31 @@ Secrets go in the environment; the non-secret app registry goes in a JSON file.
    defaults; `api_key` is required per app. The registry path is found via
    `MPULSE_APPS_CONFIG`, else `./mpulse_apps.json`.
 
+   **Custom dimensions (optional).** mPulse has no API to discover an app's
+   custom dimensions, so declare them here to make them usable without guessing.
+   Add a `custom_dimensions` object per app (top-level entries are inherited by
+   every app and merged with the app's own):
+
+   ```json
+   "custom_dimensions": { "branch": { "display": "Branch" } },
+   "apps": {
+     "app-a": {
+       "api_key": "…",
+       "custom_dimensions": {
+         "mobile_speed": { "display": "mobile speed", "description": "effectiveType" },
+         "campaign": {}
+       }
+     },
+     "app-b": { "api_key": "…", "custom_dimensions": ["checkout_step"] }
+   }
+   ```
+
+   Keys are the mPulse **wire label** (lowercased, spaces → `_`); a value may be
+   `null`, a `{display, description, values?}` object, or you may pass a plain
+   list of names. Used as a split (`metrics-by-dimension dimension=<label>`) or a
+   filter (`custom-dimension-<label>=<value>`). These are **hints only** (never
+   used to reject), since the declared list may be incomplete.
+
 2. **Secrets** — set the pre-issued mPulse **API token(s)** (mPulse → your name
    → *Account* → *Generate/Revoke API Token*). See `.env.example`:
 
@@ -179,7 +204,8 @@ fan-out; all calls share the rate limiter. See [Batch aggregate](#batch-aggregat
 query-type with wire-name params, for cases the explicit tools don't cover.
 
 **Meta** (anti-hallucination): `list_apps`, `list_query_types`,
-`describe_query(query_type)`.
+`describe_query(query_type, app=None)` (pass `app` to include that app's custom
+dimensions), `list_custom_dimensions(app=None)`.
 
 ### Output format
 
@@ -218,6 +244,24 @@ calling the API:
   (`Did you mean: …?`) — the wrong name never reaches mPulse;
 - custom timers/dimensions and the generic `query` tool are left permissive
   (forward-compatible); if the catalog is unavailable, resolution is skipped.
+
+**Custom `dimension` support is endpoint-specific.** A custom dimension (e.g.
+`branch`) is accepted **only** by `metrics-by-dimension` (as its `dimension`
+split value). `dimension-values` and `dimension-over-time` accept **built-in
+dimensions only** — a custom name there returns empty/400 (a wasted call). The
+`query` tool enforces this: a custom `dimension` on those two query-types is
+**rejected up front** with a redirect to `metrics-by-dimension`, while a
+built-in's casing is auto-corrected. `describe_query` reports
+`custom_dimension_supported` per query-type so the model knows before calling.
+
+For an app's *declared* custom dimensions (see Configure → Custom dimensions),
+the `query` tool additionally normalizes the label to its wire form
+(`mobile speed` → `mobile_speed`) for both the split value and
+`custom-dimension-<label>` filters, and adds a soft `dimension_notes` advisory
+when a name isn't in the declared set — but always passes it through (the
+declared list may be incomplete). `list_custom_dimensions(app)` and
+`describe_query(query_type, app)` expose the declared names so the model uses
+the exact label instead of guessing.
 
 **Silent-fallback `warning` (output side).** As a backstop for cases input
 resolution can't catch, when the series id/name echoed in the response does not

@@ -9,7 +9,7 @@ import respx
 import mpulse_mcp.server as server
 from mpulse_mcp.auth import TOKENS_PATH
 from mpulse_mcp.client import MpulseClient
-from mpulse_mcp.config import Registry
+from mpulse_mcp.config import AppConfig, Registry
 
 BASE = "https://mpulse.soasta.com"
 TOKENS_URL = BASE + TOKENS_PATH
@@ -238,6 +238,168 @@ async def test_query_caps_high_cardinality_by_default(wired_client) -> None:
     # geography is high-cardinality -> auto-capped at 100 with a truncation note.
     assert result["truncated"]["total"] == 150
     assert result["truncated"]["returned"] == 100
+
+
+# --- custom dimension registry ---------------------------------------------
+def _registry_with_custom_dims() -> Registry:
+    apps = {
+        "alpha": AppConfig(
+            name="alpha",
+            api_key="KEY-ALPHA",
+            tenant="tenant-a",
+            api_token_env="MPULSE_API_TOKEN",
+            custom_dimensions={
+                "branch": {"display": "Branch"},
+                "mobile_speed": {"display": "mobile speed"},
+            },
+        )
+    }
+    return Registry(default_app="alpha", apps=apps)
+
+
+def test_list_custom_dimensions(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(server, "_registry", _registry_with_custom_dims())
+    out = server.list_custom_dimensions(app="alpha")
+    assert out["app"] == "alpha"
+    assert {d["label"] for d in out["custom_dimensions"]} == {"branch", "mobile_speed"}
+
+
+def test_describe_query_includes_app_custom_dims(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(server, "_registry", _registry_with_custom_dims())
+    out = server.describe_query("metrics-by-dimension", app="alpha")
+    labels = {d["label"] for d in out.get("app_custom_dimensions", [])}
+    assert "mobile_speed" in labels
+    # without app -> no app-specific block
+    plain = server.describe_query("metrics-by-dimension")
+    assert "app_custom_dimensions" not in plain
+
+
+@pytest.fixture
+def wired_client_custom(monkeypatch: pytest.MonkeyPatch):
+    reg = _registry_with_custom_dims()
+    client = MpulseClient(reg, http=httpx.AsyncClient(base_url=BASE))
+    monkeypatch.setattr(server, "_client", client)
+    monkeypatch.setattr(server, "_registry", reg)
+    return client
+
+
+@respx.mock
+async def test_query_normalizes_custom_dimension_value(wired_client_custom) -> None:
+    respx.put(TOKENS_URL).mock(return_value=httpx.Response(201, json={"token": "T"}))
+    route = respx.get(_q_url("KEY-ALPHA", "metrics-by-dimension")).mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
+    try:
+        result = await server.query(
+            query_type="metrics-by-dimension",
+            params={"dimension": "mobile speed", "metric": "beacons",
+                    "date-comparator": "LastHour"},
+        )
+    finally:
+        await wired_client_custom.aclose()
+    # 'mobile speed' -> wire label 'mobile_speed'; declared, so no unknown flag.
+    assert route.calls.last.request.url.params["dimension"] == "mobile_speed"
+    assert any("normalized" in n for n in result.get("dimension_notes", []))
+
+
+@respx.mock
+async def test_query_flags_unknown_custom_dimension_but_passes(
+    wired_client_custom,
+) -> None:
+    respx.put(TOKENS_URL).mock(return_value=httpx.Response(201, json={"token": "T"}))
+    route = respx.get(_q_url("KEY-ALPHA", "metrics-by-dimension")).mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
+    try:
+        result = await server.query(
+            query_type="metrics-by-dimension",
+            params={"dimension": "not_declared", "metric": "beacons",
+                    "date-comparator": "LastHour"},
+        )
+    finally:
+        await wired_client_custom.aclose()
+    # soft: passes through untouched, but advises it's undeclared.
+    assert route.calls.last.request.url.params["dimension"] == "not_declared"
+    assert any("not a declared custom dimension" in n for n in result["dimension_notes"])
+
+
+@respx.mock
+async def test_query_normalizes_custom_dimension_filter_label(
+    wired_client_custom,
+) -> None:
+    respx.put(TOKENS_URL).mock(return_value=httpx.Response(201, json={"token": "T"}))
+    route = respx.get(_q_url("KEY-ALPHA", "summary")).mock(
+        return_value=httpx.Response(200, json={"n": "5", "median": "1"})
+    )
+    try:
+        result = await server.query(
+            query_type="summary",
+            params={"custom-dimension-Mobile Speed": "4g",
+                    "date-comparator": "LastHour"},
+        )
+    finally:
+        await wired_client_custom.aclose()
+    params = dict(route.calls.last.request.url.params)
+    assert params.get("custom-dimension-mobile_speed") == "4g"
+    assert any("normalized" in n for n in result.get("dimension_notes", []))
+
+
+# --- custom dimension gating ------------------------------------------------
+@respx.mock
+async def test_query_rejects_custom_dimension_for_dimension_values(wired_client) -> None:
+    route = respx.get(_q_url("KEY-ALPHA", "dimension-values")).mock(
+        return_value=httpx.Response(200, json={"values": []})
+    )
+    try:
+        result = await server.query(
+            query_type="dimension-values",
+            params={"dimension": "branch", "date-comparator": "LastHour"},
+        )
+    finally:
+        await wired_client.aclose()
+    assert result["error"] == "ValidationError"
+    assert "metrics-by-dimension" in result["message"]
+    assert route.call_count == 0  # rejected before any upstream call
+
+
+@respx.mock
+async def test_query_allows_custom_dimension_for_metrics_by_dimension(
+    wired_client,
+) -> None:
+    respx.put(TOKENS_URL).mock(return_value=httpx.Response(201, json={"token": "T"}))
+    route = respx.get(_q_url("KEY-ALPHA", "metrics-by-dimension")).mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
+    try:
+        result = await server.query(
+            query_type="metrics-by-dimension",
+            params={"dimension": "branch", "metric": "beacons",
+                    "date-comparator": "LastHour"},
+        )
+    finally:
+        await wired_client.aclose()
+    # custom dim passes through untouched to the API.
+    assert "error" not in result
+    assert route.calls.last.request.url.params["dimension"] == "branch"
+
+
+@respx.mock
+async def test_query_autocorrects_builtin_dimension_casing(wired_client) -> None:
+    respx.put(TOKENS_URL).mock(return_value=httpx.Response(201, json={"token": "T"}))
+    route = respx.get(_q_url("KEY-ALPHA", "dimension-values")).mock(
+        return_value=httpx.Response(200, json={"values": ["Chrome/1"]})
+    )
+    try:
+        result = await server.query(
+            query_type="dimension-values",
+            params={"dimension": "Browser", "date-comparator": "LastHour"},
+        )
+    finally:
+        await wired_client.aclose()
+    assert route.calls.last.request.url.params["dimension"] == "browser"
+    assert any("auto-corrected" in c for c in result.get("dimension_notes", []))
 
 
 # --- probe / empty_reason (#5) ---------------------------------------------

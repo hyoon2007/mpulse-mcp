@@ -16,7 +16,7 @@ from mcp.server.fastmcp import FastMCP
 
 from . import __version__, log
 from .client import MpulseClient
-from .config import Registry, load_registry
+from .config import AppConfig, Registry, load_registry
 from .errors import MpulseError, ValidationError
 from .query_types import (
     DRILLDOWN_PARAMS,
@@ -579,6 +579,23 @@ async def query(
             "message": "Provide either 'date' or 'date-comparator', not both.",
         }
 
+    # Reject a custom dimension on the endpoints that don't accept one
+    # (dimension-values / dimension-over-time), before spending a wasted call;
+    # auto-correct a built-in's casing. metrics-by-dimension accepts custom names.
+    dim_note = _resolve_dimension_param(query_type, wire)
+    if isinstance(dim_note, dict):  # a ValidationError payload
+        return dim_note
+
+    dim_notes: list[str] = [dim_note] if isinstance(dim_note, str) else []
+
+    # Normalize custom-dimension labels/values against the app's declared set
+    # (hints only — never rejected, since the declared list may be incomplete).
+    try:
+        app_cfg = _get_registry().get(app)
+    except MpulseError:
+        app_cfg = None
+    dim_notes += _normalize_custom_dimension_params(query_type, wire, app_cfg)
+
     effective_limit = limit
     if effective_limit is None and query_type in _HIGH_CARDINALITY_QUERY_TYPES:
         effective_limit = _DEFAULT_HIGH_CARDINALITY_LIMIT
@@ -601,9 +618,96 @@ async def query(
         history_mode=history_mode,
         limit=effective_limit,
     )
+    if dim_notes:
+        result["dimension_notes"] = dim_notes
     if probe:
         await _probe_empty_reason(client, app, query_type, wire, result)
     return result
+
+
+def _resolve_dimension_param(
+    query_type: str, wire: dict[str, Any]
+) -> dict[str, Any] | str | None:
+    """Validate/auto-correct the ``dimension`` wire param for dimension endpoints.
+
+    Returns a ValidationError payload (dict) to short-circuit, a correction note
+    (str) when a built-in's casing was fixed, or ``None`` when there is nothing
+    to do (custom dimension accepted, exact match, or non-dimension query-type).
+    """
+    from .catalog import resolve_dimension
+
+    value = wire.get("dimension")
+    status, payload = resolve_dimension(value, query_type)
+    if status == "ok" and payload != value:
+        wire["dimension"] = payload
+        return f"dimension {value!r} auto-corrected to {payload!r}"
+    if status == "unknown_no_custom":
+        hint = (
+            f"'{query_type}' accepts BUILT-IN dimensions only — custom dimensions "
+            "(e.g. 'branch') are not supported here. To break data down by a "
+            "custom dimension, use metrics-by-dimension with dimension=<name>."
+        )
+        if payload:
+            hint += f" Or did you mean a built-in: {', '.join(payload)}?"
+        return {
+            "error": "ValidationError",
+            "message": (
+                f"Unknown dimension {value!r} for query-type '{query_type}'.\n"
+                f"Hint: {hint}"
+            ),
+        }
+    return None
+
+
+def _normalize_custom_dimension_params(
+    query_type: str, wire: dict[str, Any], app_cfg: AppConfig | None
+) -> list[str]:
+    """Normalize custom-dimension label/value casing and hint on unknown names.
+
+    Hints only — mPulse has no discovery API and the declared list may be
+    incomplete, so a custom name is normalized and (softly) flagged, never
+    rejected. Handles both the metrics-by-dimension split value and any
+    ``custom-dimension-<label>`` filter key. Returns advisory notes.
+    """
+    from .catalog import resolve_dimension
+    from .config import custom_dimension_wire_label
+
+    known = app_cfg.custom_dimensions if app_cfg else {}
+    app_label = f" for app '{app_cfg.name}'" if app_cfg else ""
+    notes: list[str] = []
+
+    def _flag_unknown(label: str, kind: str) -> None:
+        if known and label not in known:
+            notes.append(
+                f"{kind} '{label}' is not a declared custom dimension{app_label} "
+                f"(declared: {', '.join(sorted(known))}). Proceeding; verify the "
+                f"exact name via list_custom_dimensions."
+            )
+
+    # (a) metrics-by-dimension split value, only when it's a custom (non-builtin) name
+    if query_type == "metrics-by-dimension":
+        val = wire.get("dimension")
+        if isinstance(val, str) and val:
+            status, _ = resolve_dimension(val, query_type)
+            if status == "ok_custom":
+                label = custom_dimension_wire_label(val)
+                if label != val:
+                    wire["dimension"] = label
+                    notes.append(f"dimension {val!r} normalized to {label!r}")
+                _flag_unknown(label, "dimension")
+
+    # (b) custom-dimension-<label> filter keys (any query-type)
+    for key in list(wire.keys()):
+        if not key.startswith("custom-dimension-"):
+            continue
+        raw_label = key[len("custom-dimension-"):]
+        label = custom_dimension_wire_label(raw_label)
+        if label != raw_label:
+            wire[f"custom-dimension-{label}"] = wire.pop(key)
+            notes.append(f"filter label {raw_label!r} normalized to {label!r}")
+        _flag_unknown(label, "custom-dimension filter")
+
+    return notes
 
 
 # ===========================================================================
@@ -860,6 +964,38 @@ def list_apps() -> dict[str, Any]:
 
 
 @mcp.tool()
+def list_custom_dimensions(app: str | None = None) -> dict[str, Any]:
+    """List the custom dimensions configured for an app (or the default app).
+
+    mPulse has **no API to discover custom dimensions**, so they are declared in
+    the app registry. Each entry's key is the exact **wire label** to use:
+    - as a split: `metrics-by-dimension` with `dimension=<label>`
+    - as a filter: `custom-dimension-<label>=<value>` on any query
+
+    Use this before querying a custom dimension so you use the exact name.
+    Returns `{app, custom_dimensions: [{label, display, description}]}`. An empty
+    list means none are configured (not necessarily that none exist).
+    """
+    try:
+        reg = _get_registry()
+        app_cfg = reg.get(app)
+    except MpulseError as exc:
+        return {"error": type(exc).__name__, "message": exc.user_message()}
+    return {
+        "app": app_cfg.name,
+        "custom_dimensions": [
+            {
+                "label": label,
+                "display": meta.get("display", label),
+                "description": meta.get("description", ""),
+                **({"values": meta["values"]} if meta.get("values") else {}),
+            }
+            for label, meta in app_cfg.custom_dimensions.items()
+        ],
+    }
+
+
+@mcp.tool()
 def list_query_types() -> dict[str, Any]:
     """List the mPulse query-types this server knows about, with one-line summaries.
 
@@ -876,11 +1012,13 @@ def list_query_types() -> dict[str, Any]:
 
 
 @mcp.tool()
-def describe_query(query_type: str) -> dict[str, Any]:
+def describe_query(query_type: str, app: str | None = None) -> dict[str, Any]:
     """Describe a query-type: parameters, drilldowns, response shape, and caveats.
 
     Pass a slug from `list_query_types` (e.g. `summary`, `timers-metrics`,
-    `geography`).
+    `geography`). Pass `app` to also include that app's configured **custom
+    dimensions** (usable as a `metrics-by-dimension` split or a
+    `custom-dimension-<label>` filter).
     """
     meta = describe_qt(query_type)
     if meta is None:
@@ -909,6 +1047,18 @@ def describe_query(query_type: str) -> dict[str, Any]:
     from .catalog import enrich_describe
 
     result.update(enrich_describe(query_type))
+
+    # App-specific custom dimensions (mPulse has no API to discover these).
+    if app is not None:
+        try:
+            app_cfg = _get_registry().get(app)
+            if app_cfg.custom_dimensions:
+                result["app_custom_dimensions"] = [
+                    {"label": label, "display": m.get("display", label)}
+                    for label, m in app_cfg.custom_dimensions.items()
+                ]
+        except MpulseError:
+            pass  # describe is best-effort; a bad app name shouldn't break it
     return result
 
 

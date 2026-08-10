@@ -126,6 +126,69 @@ def resolve_value(kind: str, name: Any, query_type: str) -> tuple[str, Any]:
     return ("unknown", suggestions)
 
 
+def custom_dimension_supported(query_type: str) -> bool | None:
+    """Does ``query_type`` accept a CUSTOM dimension for its ``dimension`` param?
+
+    True (metrics-by-dimension), False (dimension-values, dimension-over-time),
+    or None when the catalog is unavailable / the query-type isn't a dimension
+    endpoint.
+    """
+    support = load().get("custom_dimension_support", {}).get("by_query_type", {})
+    if query_type == "dimensions-over-time":  # tolerate the plural alias
+        query_type = "dimension-over-time"
+    return support.get(query_type)
+
+
+def _dimension_enum_for(query_type: str) -> list[str]:
+    dims = _dimensions()
+    dv = list(dims.get("dimension_values__dimension_enum", {}).get("enum", []))
+    mbd = list(dims.get("metrics_by_dimension__dimension_split_enum", {}).get("enum", []))
+    if query_type == "dimension-values":
+        return dv
+    if query_type in ("dimension-over-time", "dimensions-over-time"):
+        # built-in only; accept either enum's names to avoid false rejections.
+        return list(dict.fromkeys(dv + mbd))
+    if query_type == "metrics-by-dimension":
+        return mbd
+    return []
+
+
+def resolve_dimension(name: Any, query_type: str) -> tuple[str, Any]:
+    """Resolve a ``dimension`` value, honoring per-endpoint custom-dimension rules.
+
+    Returns ``(status, payload)``:
+
+    * ``("ok", canonical)`` — matched a built-in (casing/separator corrected).
+    * ``("ok_custom", name)`` — not a built-in, but this endpoint accepts custom
+      dimensions (metrics-by-dimension) → pass through unchanged.
+    * ``("unknown_no_custom", [suggestions])`` — not a built-in and this endpoint
+      does NOT accept custom dimensions (dimension-values / dimension-over-time)
+      → the caller should reject before spending an upstream call.
+    * ``("skip", None)`` — empty value, catalog unavailable, or non-dimension
+      query-type.
+    """
+    if not name or not isinstance(name, str):
+        return ("skip", None)
+    supports_custom = custom_dimension_supported(query_type)
+    enum = _dimension_enum_for(query_type)
+    if supports_custom is None or not enum:
+        return ("skip", None)
+
+    norm_map = {_norm(e): e for e in enum}
+    hit = norm_map.get(_norm(name))
+    if hit is not None:
+        return ("ok", hit)
+    if supports_custom:
+        return ("ok_custom", name)
+    suggestions = difflib.get_close_matches(name, enum, n=3, cutoff=0.5)
+    if not suggestions:
+        suggestions = [
+            norm_map[m]
+            for m in difflib.get_close_matches(_norm(name), list(norm_map), n=3, cutoff=0.5)
+        ]
+    return ("unknown_no_custom", suggestions)
+
+
 def enrich_describe(query_type: str) -> dict[str, Any]:
     """Catalog-derived valid-value hints for ``describe_query`` output.
 
@@ -174,6 +237,18 @@ def enrich_describe(query_type: str) -> dict[str, Any]:
                 "enum", []
             )
         )
+
+    # Whether a CUSTOM dimension (e.g. 'branch') is accepted for the `dimension`
+    # param — true only for metrics-by-dimension. Surfacing this stops the model
+    # from wasting a call on dimension-values/dimension-over-time with a custom
+    # name (which return empty/400).
+    supports_custom = custom_dimension_supported(query_type)
+    if supports_custom is not None:
+        cds = catalog.get("custom_dimension_support", {})
+        out["custom_dimension_supported"] = supports_custom
+        out["custom_dimension_note"] = cds.get("note", "")
+        if not supports_custom:
+            out["custom_dimension_redirect"] = cds.get("redirect", "")
 
     # broadly-useful reference bits
     ev = dims.get("enumerated_values", {})
