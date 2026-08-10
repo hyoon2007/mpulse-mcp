@@ -16,6 +16,48 @@ from __future__ import annotations
 from mpulse_mcp import catalog
 
 
+# --- name resolution (auto-correct + suggest) ------------------------------
+def test_resolve_timer_casing_and_separator_corrected() -> None:
+    # snake/lower input -> canonical CamelCase timer.
+    assert catalog.resolve_value("timer", "largest_contentful_paint", "summary") == (
+        "ok",
+        "LargestContentfulPaint",
+    )
+    assert catalog.resolve_value("timer", "pageload", "by-minute") == ("ok", "PageLoad")
+
+
+def test_resolve_metric_is_endpoint_specific() -> None:
+    # Same concept, different name space per endpoint.
+    assert catalog.resolve_value(
+        "metric", "largest_contentful_paint", "metrics-by-dimension"
+    ) == ("ok", "largest_contentful_paint")
+    # verified_live_extra entry is accepted for timers-metrics.
+    assert catalog.resolve_value("metric", "TotalRequestCount", "timers-metrics") == (
+        "ok",
+        "TotalRequestCount",
+    )
+
+
+def test_resolve_custom_timer_pattern_is_ok() -> None:
+    assert catalog.resolve_value("timer", "CustomTimer3", "summary") == (
+        "ok",
+        "CustomTimer3",
+    )
+
+
+def test_resolve_none_or_empty_skips() -> None:
+    assert catalog.resolve_value("timer", None, "summary") == ("skip", None)
+    assert catalog.resolve_value("metric", "", "timers-metrics") == ("skip", None)
+
+
+def test_resolve_unknown_returns_suggestions() -> None:
+    status, suggestions = catalog.resolve_value(
+        "timer", "LargestContentofulPaint", "summary"  # typo
+    )
+    assert status == "unknown"
+    assert "LargestContentfulPaint" in suggestions
+
+
 # --- catalog.json integrity ------------------------------------------------
 def test_catalog_json_loads() -> None:
     data = catalog.load()

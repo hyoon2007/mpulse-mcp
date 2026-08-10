@@ -199,13 +199,25 @@ for monthly p75, don't average the history), mPulse `statistics`, `histogram`
 buckets, and `summary` are kept in full regardless of mode. A `peak`
 (`{index/x, value/y}`) is added so "when did it spike?" survives downsampling.
 
-**Silent-fallback `warning`.** mPulse answers an unrecognized `timer`/`metric`
-with a *default* (PageLoad) series instead of erroring. When the requested name
-does not match the series id/name echoed in the response, the result carries a
-`warning` field so the caller knows the data is **not** for the requested name.
-Casing/separator-only differences (`largest_contentful_paint` vs
-`LargestContentfulPaint`) are treated as a match and never warn. The `warning`
-is additive metadata and appears in `raw` mode too (data stays untouched).
+**`timer`/`metric` name resolution (input side).** mPulse silently answers an
+unrecognized `timer`/`metric` with a *default* (PageLoad) series instead of
+erroring, so the explicit tools resolve these names against the catalog before
+calling the API:
+
+- a casing/separator-only mismatch (`largest_contentful_paint` →
+  `LargestContentfulPaint`, endpoint-specific) is **auto-corrected** silently
+  (zero extra round-trips); the fix is reported in a `corrections` field;
+- a genuinely unknown name is **rejected** with close suggestions
+  (`Did you mean: …?`) — the wrong name never reaches mPulse;
+- custom timers/dimensions and the generic `query` tool are left permissive
+  (forward-compatible); if the catalog is unavailable, resolution is skipped.
+
+**Silent-fallback `warning` (output side).** As a backstop for cases input
+resolution can't catch, when the series id/name echoed in the response does not
+match the requested `timer`/`metric`, the result carries a `warning` so the
+caller knows the data is **not** for the requested name. Casing/separator-only
+differences are treated as a match and never warn. The `warning` is additive
+metadata and appears in `raw` mode too (data stays untouched).
 
 **Payload instrumentation.** Every successful query logs
 `payload app=… query=… bytes=… points=…` to **stderr**, for measuring response
