@@ -5,8 +5,61 @@ from __future__ import annotations
 import pytest
 
 from mpulse_mcp.errors import ValidationError
-from mpulse_mcp.formatting import normalize
+from mpulse_mcp.formatting import _detect_silent_fallback, normalize
 from mpulse_mcp.server import _check_single_day, _validate_and_build_time
+
+
+# --- silent-fallback detection ---------------------------------------------
+def test_fallback_warns_when_returned_id_differs() -> None:
+    # Requested a (typo) timer; mPulse silently answered with PageLoad.
+    data = {"series": {"series": [{"name": "PageLoad", "aPoints": [{"x": 0, "y": 1}]}]}}
+    out = normalize(
+        app="alpha",
+        query_type="by-minute",
+        request_params={"timer": "LargestContentofulPaint", "date": "2026-08-03"},
+        aggregation="per-minute",
+        data=data,
+        raw=False,
+    )
+    assert "warning" in out
+    assert "SILENT FALLBACK" in out["warning"]
+
+
+def test_no_fallback_warning_on_casing_or_separator_difference() -> None:
+    # snake_case request vs CamelCase returned id = SAME metric, must not warn.
+    data = {"values": [{"id": "LargestContentfulPaint", "history": [1], "latest": 1}]}
+    assert (
+        _detect_silent_fallback(
+            {"metric": "largest_contentful_paint"}, data
+        )
+        is None
+    )
+
+
+def test_no_fallback_warning_when_id_matches() -> None:
+    data = {"values": [{"id": "PageLoad", "history": [1], "latest": 1}]}
+    assert _detect_silent_fallback({"timer": "PageLoad"}, data) is None
+
+
+def test_no_fallback_warning_for_summary_shape() -> None:
+    # Flat summary carries no series id -> cannot (and must not) warn.
+    data = {"median": "1", "n": "5"}
+    assert _detect_silent_fallback({"timer": "PageLoad"}, data) is None
+
+
+def test_fallback_warning_present_in_raw_mode() -> None:
+    data = {"values": [{"id": "PageLoad", "history": [1], "latest": 1}]}
+    out = normalize(
+        app="alpha",
+        query_type="timers-metrics",
+        request_params={"metric": "not_a_real_metric"},
+        aggregation="per-minute",
+        data=data,
+        raw=True,
+    )
+    assert out["raw"] is True
+    assert out["data"] == data  # data still untouched
+    assert "warning" in out
 
 
 # --- normalization ---------------------------------------------------------
