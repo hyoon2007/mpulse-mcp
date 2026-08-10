@@ -280,9 +280,18 @@ every endpoint's reference doc:
   etc.
 
 `describe_query` surfaces a `parameter_mechanics` block (which params are
-comma-separated vs repeat-key) so the model sets values correctly. Note:
-`metrics-by-dimension` also computes percentiles and takes native `sortby` /
-`limit`, returning a `{columnNames, data:[[…]]}` table.
+comma-separated vs repeat-key) plus an `endpoint_params` block — the
+**per-endpoint** contract compiled from every reference page: value params with
+defaults, special params (`limit`, `sortby`, `interval`, `series-format`) with
+ranges, whether drilldown filters apply, and constraints. So the model knows,
+before calling, e.g. that `metrics-by-dimension` takes native `sortby`/`limit`
+(1-100, not valid for page_group/browser/country/bw_block/ab_test), computes
+percentiles, and returns a `{columnNames, data:[[…]]}` table; that
+`dimension-values` accepts **no** filters; that `dimension-over-time` has its own
+dimension enum plus `interval`/`limit` (1-10); that `metric-per-page-load-time`
+uses a distinct single `metric`; and that the report endpoints (`geography`,
+`page-groups`, `browsers`, `ab-tests`, `bandwidth`) have **no** native
+`limit`/`sortby` (use the client-side `limit`).
 
 **Silent-fallback `warning` (output side).** As a backstop for cases input
 resolution can't catch, when the series id/name echoed in the response does not
