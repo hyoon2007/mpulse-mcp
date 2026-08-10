@@ -231,10 +231,15 @@ metadata and appears in `raw` mode too (data stays untouched).
 size / token cost (e.g. before/after future history-reduction work).
 
 **`limit` — high-cardinality caps.** `dimension-values`, `geography`,
-`page-groups`, `browsers`, … can return hundreds of rows. On the `query` tool
-these query-types are capped at 100 by default (pass an explicit `limit` to
-change it); when trimmed, the result carries `truncated: {key, total, returned}`
-so nothing silently disappears. `raw=true` is never trimmed.
+`page-groups`, `browsers`, … can return hundreds–thousands of rows (verified
+live: ~215 countries for `geography`, ~1,400 values for `dimension-values`
+browser). On the `query` tool these query-types are capped at 100 by default
+(pass an explicit `limit` to change it); when trimmed, the result carries
+`truncated: {key, total, returned[, sorted_by]}` so nothing silently disappears.
+When the rows carry a count field (e.g. geography's `timerN`), they are **sorted
+by volume descending before trimming** (`sorted_by`), so the top markets survive
+rather than an alphabetical slice; rows without a count (dimension-values'
+strings) keep their order. `raw=true` is never trimmed.
 
 **`empty_reason` + `probe` — why is it empty?** An unsupported drilldown
 combination and genuine no-traffic both come back empty. Every empty result now

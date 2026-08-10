@@ -249,15 +249,32 @@ def _classify_empty(drilldowns: dict[str, Any]) -> tuple[str, str]:
     )
 
 
+# Count fields seen on high-cardinality rows (verified live: geography rows use
+# 'timerN'). When present we keep the TOP rows by volume, not an arbitrary slice.
+_COUNT_KEYS = ("timerN", "n", "count", "beacons")
+
+
+def _row_count(row: dict[str, Any], count_key: str) -> float:
+    try:
+        return float(row.get(count_key))
+    except (TypeError, ValueError):
+        return float("-inf")
+
+
 def _apply_limit(body: dict[str, Any], limit: int | None) -> dict[str, Any] | None:
     """Truncate the largest top-level list in ``body`` to ``limit`` items.
 
-    Returns truncation metadata ``{key, total, returned}`` when it trims
-    something, else ``None``. Mutates ``body`` in place (the list value is
-    replaced by its prefix). Non-list bodies and ``limit is None`` are no-ops.
-    This is shape-agnostic on purpose: the high-cardinality query-types
-    (dimension-values, geography, page-groups, …) have differing keys, but each
-    puts its rows in one dominant list.
+    Returns truncation metadata ``{key, total, returned[, sorted_by]}`` when it
+    trims something, else ``None``. Mutates ``body`` in place. Non-list bodies
+    and ``limit is None`` are no-ops. Shape-agnostic: the high-cardinality
+    query-types (dimension-values, geography, page-groups, …) use different keys
+    but each puts its rows in one dominant list.
+
+    When the rows are objects carrying a count field (e.g. geography's
+    ``timerN``), the rows are sorted by that count **descending** before
+    trimming, so the highest-volume rows survive rather than an alphabetical
+    prefix. Rows without a count (e.g. dimension-values' plain strings) keep
+    their original order.
     """
     if limit is None or limit < 0 or not isinstance(body, dict):
         return None
@@ -269,9 +286,21 @@ def _apply_limit(body: dict[str, Any], limit: int | None) -> dict[str, Any] | No
             key, longest = k, len(v)
     if key is None or longest <= limit:
         return None
+
+    rows = body[key]
     total = longest
-    body[key] = body[key][:limit]
-    return {"key": key, "total": total, "returned": limit}
+    sorted_by = None
+    if rows and all(isinstance(r, dict) for r in rows):
+        count_key = next((ck for ck in _COUNT_KEYS if ck in rows[0]), None)
+        if count_key:
+            rows = sorted(rows, key=lambda r: _row_count(r, count_key), reverse=True)
+            sorted_by = count_key
+
+    body[key] = rows[:limit]
+    info: dict[str, Any] = {"key": key, "total": total, "returned": limit}
+    if sorted_by:
+        info["sorted_by"] = sorted_by
+    return info
 
 
 def _strip_envelope(query_type: str, data: dict[str, Any]) -> dict[str, Any]:
