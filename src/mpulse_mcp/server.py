@@ -151,19 +151,21 @@ async def _run(
 
     client = _get_client()
     app_name = app or client.registry.default_app
+    corrections: list[str] = []
     try:
         time_params = _validate_and_build_time(date, date_comparator, timezone)
         params: dict[str, Any] = {}
         params.update({k: v for k, v in value_params.items() if v is not None})
         params.update(time_params)
         params.update(drilldowns)
+        corrections = _resolve_value_names(query_type, params)
         data = await client.query(app=app, query_type=query_type, params=params)
     except MpulseError as exc:
         return {"error": type(exc).__name__, "message": exc.user_message()}
 
     # Re-add format for metadata parity (client injects it on the wire).
     params.setdefault("format", "json")
-    return normalize(
+    result = normalize(
         app=app_name,
         query_type=query_type,
         request_params=params,
@@ -172,6 +174,41 @@ async def _run(
         raw=raw,
         history_mode=history_mode,
     )
+    if corrections:
+        result["corrections"] = corrections
+    return result
+
+
+def _resolve_value_names(query_type: str, params: dict[str, Any]) -> list[str]:
+    """Auto-correct known ``timer``/``metric`` names in-place, or reject bad ones.
+
+    Uses the catalog to (a) canonicalize a casing/separator-only mismatch
+    silently — avoiding a silent PageLoad fallback at zero token cost — and
+    (b) raise a :class:`ValidationError` with close suggestions when a value is
+    genuinely unknown, so a wrong name never reaches mPulse. Custom timers and
+    values are left untouched; if the catalog is unavailable this is a no-op.
+    Returns human-readable notes for any auto-corrections made.
+    """
+    from .catalog import resolve_value
+
+    notes: list[str] = []
+    for kind in ("timer", "metric"):
+        value = params.get(kind)
+        status, payload = resolve_value(kind, value, query_type)
+        if status == "ok" and payload != value:
+            params[kind] = payload
+            notes.append(f"{kind} {value!r} auto-corrected to {payload!r}")
+        elif status == "unknown":
+            hint = (
+                f"Did you mean: {', '.join(payload)}?"
+                if payload
+                else f"Call describe_query('{query_type}') for valid {kind} values."
+            )
+            raise ValidationError(
+                f"Unknown {kind} {value!r} for query-type '{query_type}'.",
+                hint=hint,
+            )
+    return notes
 
 
 # ===========================================================================

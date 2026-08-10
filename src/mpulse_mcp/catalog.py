@@ -16,12 +16,18 @@ dashboard report-builder; see ``_meta.custom_metric_source`` in the JSON.
 
 from __future__ import annotations
 
+import difflib
 import json
+import re
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 _CATALOG_PATH = Path(__file__).with_name("catalog.json")
+
+# Timer enum carries a placeholder pattern entry, e.g. "CustomTimer[0-9]".
+_PLACEHOLDER_SUFFIX = "[0-9]"
+_CUSTOM_TIMER_RE = re.compile(r"^CustomTimer[0-9]$", re.IGNORECASE)
 
 
 @lru_cache(maxsize=1)
@@ -59,6 +65,65 @@ def date_comparators() -> list[str]:
     return list(load().get("common_params", {}).get("date_comparator", {}).get(
         "docs_enum", []
     ))
+
+
+# --- Name resolution (auto-correct + suggest) ------------------------------
+def _norm(s: str) -> str:
+    """Casing/separator-insensitive key: 'largest_contentful_paint' == 'LargestContentfulPaint'."""
+    return "".join(c for c in s.lower() if c.isalnum())
+
+
+def _enum_for(kind: str, query_type: str) -> list[str]:
+    """The catalog enum a timer/metric value should be checked against.
+
+    The metric name space is endpoint-specific (CamelCase for timers-metrics,
+    snake_case for metrics-by-dimension), so the query-type selects the enum.
+    """
+    if kind == "timer":
+        return _timers()
+    if kind == "metric":
+        if query_type in ("metrics-by-dimension", "metric-per-page-load-time"):
+            return _mbd_metrics()
+        return _tm_metrics()  # timers-metrics, dimension-over-time, default
+    return []
+
+
+def resolve_value(kind: str, name: Any, query_type: str) -> tuple[str, Any]:
+    """Resolve a ``timer``/``metric`` value against the catalog.
+
+    Returns ``(status, payload)``:
+
+    * ``("ok", canonical)`` — matched; ``canonical`` may differ from ``name``
+      only in casing/separators (auto-correctable).
+    * ``("unknown", [suggestions])`` — catalog present but no confident match;
+      payload is up to 3 close candidates (possibly empty).
+    * ``("skip", None)`` — nothing to check: empty/non-str value, catalog
+      unavailable, unknown endpoint, or a ``CustomTimer[0-9]`` value.
+
+    This is intentionally scoped to the two names that mPulse silently falls
+    back on; custom timers/dimensions are never validated.
+    """
+    if not name or not isinstance(name, str):
+        return ("skip", None)
+    if kind == "timer" and _CUSTOM_TIMER_RE.match(name):
+        return ("ok", name)
+
+    enum = [e for e in _enum_for(kind, query_type) if not e.endswith(_PLACEHOLDER_SUFFIX)]
+    if not enum:  # catalog missing or endpoint has no enum -> stay permissive
+        return ("skip", None)
+
+    norm_map = {_norm(e): e for e in enum}
+    hit = norm_map.get(_norm(name))
+    if hit is not None:
+        return ("ok", hit)
+
+    suggestions = difflib.get_close_matches(name, enum, n=3, cutoff=0.5)
+    if not suggestions:
+        suggestions = [
+            norm_map[m]
+            for m in difflib.get_close_matches(_norm(name), list(norm_map), n=3, cutoff=0.5)
+        ]
+    return ("unknown", suggestions)
 
 
 def enrich_describe(query_type: str) -> dict[str, Any]:
