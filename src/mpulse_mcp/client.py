@@ -120,8 +120,9 @@ class MpulseClient:
         app_cfg = self._registry.get(app)
         api_token = self._registry.api_token(app_cfg)
 
-        query_params = _clean_params(params)
-        query_params["format"] = "json"
+        # Flatten to (key, value) pairs so list values become REPEATED keys.
+        query_params = [(k, v) for (k, v) in _clean_params(params) if k != "format"]
+        query_params.append(("format", "json"))
 
         path = QUERY_PATH_TEMPLATE.format(
             api_key=quote(app_cfg.api_key, safe=""),
@@ -160,7 +161,7 @@ class MpulseClient:
         self,
         *,
         path: str,
-        params: dict[str, str],
+        params: list[tuple[str, str]],
         token: str,
         app_cfg: AppConfig,
     ) -> httpx.Response:
@@ -268,15 +269,35 @@ def _log_payload_stats(
     )
 
 
-def _clean_params(params: dict[str, object]) -> dict[str, str]:
-    out: dict[str, str] = {}
+def _scalarize(value: object) -> str:
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    return str(value)
+
+
+def _clean_params(params: dict[str, object]) -> list[tuple[str, str]]:
+    """Flatten params to ``(key, value)`` pairs for httpx.
+
+    ``None`` is dropped. A **list/tuple** value expands to REPEATED keys — this
+    is how mPulse takes multiple values for repeat-style params, e.g.
+    ``custom-dimension-branch=uk&custom-dimension-branch=us`` and repeated
+    ``metric=``/``timer=``/filters. (A comma-separated param like
+    metrics-by-dimension's ``metrics`` is passed as a single pre-joined string,
+    not a list.) ``bool`` -> ``'true'``/``'false'``.
+    """
+    out: list[tuple[str, str]] = []
     for key, value in params.items():
         if value is None:
             continue
-        if isinstance(value, bool):
-            out[key] = "true" if value else "false"
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                if item is None:
+                    continue
+                out.append((key, _scalarize(item)))
         else:
-            out[key] = str(value)
+            out.append((key, _scalarize(value)))
     return out
 
 

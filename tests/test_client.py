@@ -7,7 +7,7 @@ import pytest
 import respx
 
 from mpulse_mcp.auth import TOKENS_PATH
-from mpulse_mcp.client import AUTH_HEADER, MpulseClient, _count_points
+from mpulse_mcp.client import AUTH_HEADER, MpulseClient, _clean_params, _count_points
 from mpulse_mcp.config import Registry
 from mpulse_mcp.errors import LiteAccountError, RateLimitError
 
@@ -21,6 +21,51 @@ def _q_url(api_key: str, qt: str) -> str:
 
 def _mint(token: str = "SEC") -> None:
     respx.put(TOKENS_URL).mock(return_value=httpx.Response(201, json={"token": token}))
+
+
+# --- param serialization (list -> repeated keys) ---------------------------
+def test_clean_params_expands_lists_bool_and_drops_none() -> None:
+    out = _clean_params(
+        {"k": ["a", "b"], "flag": True, "off": False, "skip": None, "s": "x,y"}
+    )
+    assert ("k", "a") in out and ("k", "b") in out  # list -> repeated key
+    assert ("flag", "true") in out and ("off", "false") in out
+    assert all(key != "skip" for key, _ in out)  # None dropped
+    assert ("s", "x,y") in out  # comma string stays a single value
+
+
+@respx.mock
+async def test_list_param_becomes_repeated_query_keys(registry: Registry) -> None:
+    _mint()
+    route = respx.get(_q_url("KEY-ALPHA", "metrics-by-dimension")).mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
+    client = MpulseClient(registry, http=httpx.AsyncClient(base_url=BASE))
+    try:
+        await client.query(
+            app="alpha",
+            query_type="metrics-by-dimension",
+            params={
+                "dimension": "branch",
+                "metrics": "beacons,largest_contentful_paint",  # comma string
+                "custom-dimension-branch": ["uk", "us", "sec"],  # repeat list
+            },
+        )
+    finally:
+        await client.aclose()
+
+    req = route.calls.last.request
+    items = req.url.params.multi_items()
+    branches = [v for (k, v) in items if k == "custom-dimension-branch"]
+    assert branches == ["uk", "us", "sec"]  # expanded to repeated keys
+    # comma-separated metrics param stays a single value
+    assert [v for (k, v) in items if k == "metrics"] == [
+        "beacons,largest_contentful_paint"
+    ]
+    # no python-list repr leaked onto the wire
+    assert "%5B" not in str(req.url) and "['uk'" not in str(req.url)
+    # format=json present exactly once
+    assert [v for (k, v) in items if k == "format"] == ["json"]
 
 
 # --- instrumentation -------------------------------------------------------
