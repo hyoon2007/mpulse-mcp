@@ -23,6 +23,28 @@ def test_apply_limit_truncates_longest_list() -> None:
     assert body["meta"] == {"x": 1}  # untouched
 
 
+def test_apply_limit_sorts_by_count_before_truncating() -> None:
+    # geography-shaped rows (verified live): {country, timerN, ...}. Low-volume
+    # rows come first in input; the top-by-volume must survive the cap.
+    rows = [{"country": f"C{i}", "timerN": str(i)} for i in range(150)]  # ascending
+    body = {"data": rows}
+    info = _apply_limit(body, 10)
+    assert info == {"key": "data", "total": 150, "returned": 10, "sorted_by": "timerN"}
+    kept = body["data"]
+    assert len(kept) == 10
+    # highest timerN (149) is first; smallest kept is 140 — none of the tiny ones.
+    assert kept[0]["timerN"] == "149"
+    assert all(int(r["timerN"]) >= 140 for r in kept)
+
+
+def test_apply_limit_no_count_keeps_order() -> None:
+    # dimension-values shape: plain strings, no volume -> alphabetical prefix.
+    body = {"values": [f"Chrome/{i}" for i in range(150)]}
+    info = _apply_limit(body, 10)
+    assert "sorted_by" not in info
+    assert body["values"] == [f"Chrome/{i}" for i in range(10)]
+
+
 def test_apply_limit_noop_when_under_limit_or_none() -> None:
     body = {"rows": [1, 2, 3]}
     assert _apply_limit(body, 50) is None
