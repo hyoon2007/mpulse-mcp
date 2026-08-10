@@ -263,6 +263,27 @@ declared list may be incomplete). `list_custom_dimensions(app)` and
 `describe_query(query_type, app)` expose the declared names so the model uses
 the exact label instead of guessing.
 
+**Passing multiple values (mechanism differs per parameter).** Verified against
+every endpoint's reference doc:
+
+- **Comma-separated, one param** — only `metrics` on `metrics-by-dimension`
+  (**plural** param name; the singular `metric` is silently ignored). Pass a
+  pre-joined string: `"metrics": "beacons,largest_contentful_paint"`.
+- **Repeated key** — `metric`/`timer` on `timers-metrics` and **every drilldown
+  filter** (`country`, `browser`, `ab-test`, …) and `custom-dimension-<label>`.
+  Pass a **JSON list** and the client expands it to repeated query keys:
+  `"custom-dimension-branch": ["uk","us","sec"]` →
+  `custom-dimension-branch=uk&…=us&…=sec` (verified live). A Python-list-repr no
+  longer leaks onto the wire.
+- **Single value** — `dimension`, `percentile`, `metric` on
+  `metric-per-page-load-time` (its own enum: `BounceRate` + `CustomMetric0-9`),
+  etc.
+
+`describe_query` surfaces a `parameter_mechanics` block (which params are
+comma-separated vs repeat-key) so the model sets values correctly. Note:
+`metrics-by-dimension` also computes percentiles and takes native `sortby` /
+`limit`, returning a `{columnNames, data:[[…]]}` table.
+
 **Silent-fallback `warning` (output side).** As a backstop for cases input
 resolution can't catch, when the series id/name echoed in the response does not
 match the requested `timer`/`metric`, the result carries a `warning` so the

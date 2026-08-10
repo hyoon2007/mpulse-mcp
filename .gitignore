@@ -22,5 +22,10 @@ venv/
 # Local Claude Code settings (machine-specific)
 .claude/settings.local.json
 
+# Editor swap / working notes
+*.swp
+.*.swp
+HANDOFF-*.md
+
 # OS
 .DS_Store

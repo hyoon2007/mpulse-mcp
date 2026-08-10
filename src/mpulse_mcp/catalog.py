@@ -52,6 +52,14 @@ def _mbd_metrics() -> list[str]:
     )
 
 
+def _mplt_metrics() -> list[str]:
+    return list(
+        load().get("metrics_for_metric_per_page_load_time__metric_param", {}).get(
+            "enum", []
+        )
+    )
+
+
 def _timers() -> list[str]:
     return list(load().get("timers_for_timer_param", {}).get("enum", []))
 
@@ -82,8 +90,10 @@ def _enum_for(kind: str, query_type: str) -> list[str]:
     if kind == "timer":
         return _timers()
     if kind == "metric":
-        if query_type in ("metrics-by-dimension", "metric-per-page-load-time"):
+        if query_type == "metrics-by-dimension":
             return _mbd_metrics()
+        if query_type == "metric-per-page-load-time":
+            return _mplt_metrics()  # distinct: BounceRate + CustomMetric0-9
         return _tm_metrics()  # timers-metrics, dimension-over-time, default
     return []
 
@@ -202,14 +212,16 @@ def enrich_describe(query_type: str) -> dict[str, Any]:
     out: dict[str, Any] = {}
     dims = _dimensions()
 
-    # metric enums differ per endpoint (CamelCase vs snake_case)
+    # metric enums differ per endpoint (CamelCase vs snake_case vs its own set)
     if query_type in ("timers-metrics", "dimension-over-time", "dimensions-over-time"):
         out["valid_metrics"] = _tm_metrics()
-    if query_type in (
-        "metrics-by-dimension",
-        "metric-per-page-load-time",
-    ):
+    if query_type == "metrics-by-dimension":
         out["valid_metrics"] = _mbd_metrics()
+        mbd = catalog.get("metrics_for_metrics_by_dimension__metric_param", {})
+        out["metric_param_name"] = mbd.get("param_name", "metrics")
+        out["metric_note"] = mbd.get("metric_singular_ignored", "")
+    if query_type == "metric-per-page-load-time":
+        out["valid_metrics"] = _mplt_metrics()  # distinct: BounceRate + CustomMetric0-9
 
     # timer enum (timer-family query-types)
     if query_type in (
@@ -268,5 +280,18 @@ def enrich_describe(query_type: str) -> dict[str, Any]:
     custom_dims = catalog.get("custom_dimensions")
     if custom_dims:
         out["custom_dimensions"] = custom_dims
+
+    # How to pass multiple values (comma vs repeated key vs single) — the whole
+    # point of this: the model must know the per-param mechanism to set values.
+    mech = catalog.get("parameter_mechanics")
+    if mech:
+        entry: dict[str, Any] = {
+            "how_to_pass": mech.get("how_to_pass", ""),
+            "multiple_via_repeated_key": mech.get("multiple_via_repeated_key", []),
+        }
+        comma = mech.get("comma_separated_in_one_param", {}).get(query_type)
+        if comma:
+            entry["comma_separated_params"] = comma
+        out["parameter_mechanics"] = entry
 
     return out

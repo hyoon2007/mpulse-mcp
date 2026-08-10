@@ -29,7 +29,8 @@
 ## enum 요약 (전체는 catalog.json)
 
 - **timers-metrics `metric`** — CamelCase 97종(+TotalRequestCount). 접두사 `Bcn/Css/Font/Html/Img/Js/Other/Page/Total/Xhr` × 접미사 `RequestCount/TransferSize/DecodedBodySize/CompressionRatio/…`.
-- **metrics-by-dimension `metric`** — snake_case 82종(`asset_*`, `css_*`, `js_*`, `image_*`, `font_*`, `html_*`, `xhr_*`, `other_*`, `page_*`, `beacon_*` 계열), 콤마구분 다중.
+- **metrics-by-dimension 지표 파라미터 = `metrics`(복수, 콤마구분)** — snake_case 82종(`asset_*`, `css_*`, `js_*`, `image_*`, `font_*`, `html_*`, `xhr_*`, `other_*`, `page_*`, `beacon_*` 계열). 예: `metrics=beacons,largest_contentful_paint`. **`metric`(단수)은 조용히 무시**되고 앱 기본 컬럼 반환. `percentile` 계산 지원 + `sortby`/`limit`(네이티브) 보유. 응답은 `{columnNames, data:[[행]]}` 테이블.
+- **metric-per-page-load-time `metric`** — 단수 전용, 기본 `BounceRate`, enum `BounceRate` + `CustomMetric0-9`(다른 엔드포인트와 완전히 다른 이름공간).
 - **timer** — 24종(`PageLoad` 기본 … `LargestContentfulPaint`, `TotalBlockingTime`, `CustomTimer[0-9]`).
 - **dimension-values `dimension`** — 24종(underscore). `connection_type` 없음 → dimension-values에서 `connection-type` 400.
 - **metrics-by-dimension split `dimension`** — 33종(underscore).
@@ -39,7 +40,8 @@
 
 - 잘못된 `timer`/`metric` → 에러 없이 **PageLoad로 조용히 폴백**. 응답 series `id`가 요청 이름과 같은지 확인.
 - 잘못된 `custom-timer` → **400**.
-- `metric`을 리스트로 넘기면 MCP에서 무시됨 → 호출당 1개 문자열.
+- **멀티값 메커니즘 (파라미터별로 다름)**: ① `metrics`(metrics-by-dimension)만 **콤마구분 1개 파라미터**. ② `metric`·`timer`(timers-metrics)와 **모든 드릴다운 필터·`custom-dimension-*`**는 **키 반복**(`country=US&country=KR`) — MCP `query` 툴엔 **JSON 리스트**로 넘기면 client가 반복키로 직렬화(`custom-dimension-branch=["uk","us"]`, 라이브 검증). ③ 나머지는 단일.
+- metrics-by-dimension는 **percentile 계산 지원**(타이머 p75 by dimension = timers-metrics와 일치). 카운트 지표(beacons)+percentile 혼합은 컬럼 null 유발 가능 → 타이머/percentile 계열끼리.
 - **`latest` = 구간 전체 집계값**. percentile metric을 `Between`으로 조회하면 `latest`가 구간 전체 백분위 → 월 p75/p50은 일별 history 평균이 아니라 `latest`를 읽기.
 - `Between`의 `date-end`는 **exclusive**(문서는 "greater than"이라고만 함). 긴 구간은 버킷 자동 coarsening.
 - rate limit: 동시 3 / 분당 100 / 시간당 10,000 / 일 50,000.

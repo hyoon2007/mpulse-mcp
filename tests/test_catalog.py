@@ -58,6 +58,37 @@ def test_resolve_unknown_returns_suggestions() -> None:
     assert "LargestContentfulPaint" in suggestions
 
 
+# --- metrics-by-dimension uses `metrics` (plural); param mechanics ----------
+def test_mbd_metric_param_is_plural_comma() -> None:
+    c = catalog.load()
+    mbd = c["metrics_for_metrics_by_dimension__metric_param"]
+    assert "metrics (PLURAL" in mbd["param_name"]
+    assert mbd["supports_percentile"] is True
+    e = catalog.enrich_describe("metrics-by-dimension")
+    assert e["metric_param_name"].startswith("metrics")
+    assert "ignored" in e["metric_note"]
+
+
+def test_metric_per_plt_distinct_enum() -> None:
+    # BounceRate + CustomMetric0-9, NOT the snake_case metrics-by-dimension set.
+    assert catalog.resolve_value(
+        "metric", "BounceRate", "metric-per-page-load-time"
+    ) == ("ok", "BounceRate")
+    e = catalog.enrich_describe("metric-per-page-load-time")
+    assert "BounceRate" in e["valid_metrics"]
+    assert "beacons" not in e["valid_metrics"]
+
+
+def test_enrich_surfaces_parameter_mechanics() -> None:
+    e = catalog.enrich_describe("metrics-by-dimension")
+    mech = e["parameter_mechanics"]
+    assert mech["comma_separated_params"] == ["metrics"]
+    assert any("custom-dimension" in p for p in mech["multiple_via_repeated_key"])
+    # a non-comma endpoint has mechanics but no comma_separated_params key
+    e2 = catalog.enrich_describe("timers-metrics")
+    assert "comma_separated_params" not in e2["parameter_mechanics"]
+
+
 # --- custom dimension support ----------------------------------------------
 def test_custom_dimension_supported_flags() -> None:
     assert catalog.custom_dimension_supported("metrics-by-dimension") is True
