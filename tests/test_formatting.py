@@ -5,8 +5,79 @@ from __future__ import annotations
 import pytest
 
 from mpulse_mcp.errors import ValidationError
-from mpulse_mcp.formatting import _detect_silent_fallback, normalize
+from mpulse_mcp.formatting import (
+    _apply_limit,
+    _classify_empty,
+    _detect_silent_fallback,
+    normalize,
+)
 from mpulse_mcp.server import _check_single_day, _validate_and_build_time
+
+
+# --- limit / truncation ----------------------------------------------------
+def test_apply_limit_truncates_longest_list() -> None:
+    body = {"meta": {"x": 1}, "rows": list(range(200))}
+    info = _apply_limit(body, 50)
+    assert info == {"key": "rows", "total": 200, "returned": 50}
+    assert body["rows"] == list(range(50))
+    assert body["meta"] == {"x": 1}  # untouched
+
+
+def test_apply_limit_noop_when_under_limit_or_none() -> None:
+    body = {"rows": [1, 2, 3]}
+    assert _apply_limit(body, 50) is None
+    assert _apply_limit({"rows": [1, 2, 3]}, None) is None
+
+
+def test_normalize_reports_truncation() -> None:
+    data = {"countries": [{"c": i} for i in range(150)]}
+    out = normalize(
+        app="alpha",
+        query_type="geography",
+        request_params={"date": "2026-08-03"},
+        aggregation="unspecified",
+        data=data,
+        raw=False,
+        limit=100,
+    )
+    assert out["truncated"] == {"key": "countries", "total": 150, "returned": 100}
+    assert len(out["body"]["countries"]) == 100
+
+
+def test_limit_ignored_in_raw_mode() -> None:
+    data = {"countries": list(range(150))}
+    out = normalize(
+        app="alpha",
+        query_type="geography",
+        request_params={},
+        aggregation="unspecified",
+        data=data,
+        raw=True,
+        limit=10,
+    )
+    assert out["data"]["countries"] == list(range(150))  # raw untouched
+
+
+# --- empty_reason heuristic ------------------------------------------------
+def test_classify_empty_levels() -> None:
+    assert _classify_empty({})[0] == "no_data"
+    assert _classify_empty({"browser": "X"})[0] == "likely_no_traffic"
+    assert _classify_empty({"browser": "X", "ab-test": "Y"})[0] == (
+        "possibly_unsupported_combo"
+    )
+
+
+def test_normalize_sets_empty_reason() -> None:
+    out = normalize(
+        app="alpha",
+        query_type="timers-metrics",
+        request_params={"date-comparator": "LastHour", "browser": "X", "ab-test": "Y"},
+        aggregation="per-minute",
+        data={"values": []},
+        raw=False,
+    )
+    assert out["empty"] is True
+    assert out["empty_reason"] == "possibly_unsupported_combo"
 
 
 # --- silent-fallback detection ---------------------------------------------
