@@ -219,6 +219,15 @@ calling the API:
 - custom timers/dimensions and the generic `query` tool are left permissive
   (forward-compatible); if the catalog is unavailable, resolution is skipped.
 
+**Custom `dimension` support is endpoint-specific.** A custom dimension (e.g.
+`branch`) is accepted **only** by `metrics-by-dimension` (as its `dimension`
+split value). `dimension-values` and `dimension-over-time` accept **built-in
+dimensions only** — a custom name there returns empty/400 (a wasted call). The
+`query` tool enforces this: a custom `dimension` on those two query-types is
+**rejected up front** with a redirect to `metrics-by-dimension`, while a
+built-in's casing is auto-corrected. `describe_query` reports
+`custom_dimension_supported` per query-type so the model knows before calling.
+
 **Silent-fallback `warning` (output side).** As a backstop for cases input
 resolution can't catch, when the series id/name echoed in the response does not
 match the requested `timer`/`metric`, the result carries a `warning` so the

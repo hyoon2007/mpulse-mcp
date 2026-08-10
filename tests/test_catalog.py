@@ -58,6 +58,40 @@ def test_resolve_unknown_returns_suggestions() -> None:
     assert "LargestContentfulPaint" in suggestions
 
 
+# --- custom dimension support ----------------------------------------------
+def test_custom_dimension_supported_flags() -> None:
+    assert catalog.custom_dimension_supported("metrics-by-dimension") is True
+    assert catalog.custom_dimension_supported("dimension-values") is False
+    assert catalog.custom_dimension_supported("dimension-over-time") is False
+    assert catalog.custom_dimension_supported("summary") is None  # not a dim endpoint
+
+
+def test_resolve_dimension_custom_allowed_for_mbd() -> None:
+    # metrics-by-dimension accepts a custom name (e.g. branch) as a pass-through.
+    assert catalog.resolve_dimension("branch", "metrics-by-dimension") == (
+        "ok_custom",
+        "branch",
+    )
+
+
+def test_resolve_dimension_custom_rejected_elsewhere() -> None:
+    for qt in ("dimension-values", "dimension-over-time"):
+        status, _ = catalog.resolve_dimension("branch", qt)
+        assert status == "unknown_no_custom"
+
+
+def test_resolve_dimension_builtin_casing_corrected() -> None:
+    assert catalog.resolve_dimension("Browser", "dimension-values") == ("ok", "browser")
+
+
+def test_enrich_describe_exposes_custom_dimension_flag() -> None:
+    dv = catalog.enrich_describe("dimension-values")
+    assert dv["custom_dimension_supported"] is False
+    assert dv.get("custom_dimension_redirect") == "metrics-by-dimension"
+    mbd = catalog.enrich_describe("metrics-by-dimension")
+    assert mbd["custom_dimension_supported"] is True
+
+
 # --- catalog.json integrity ------------------------------------------------
 def test_catalog_json_loads() -> None:
     data = catalog.load()

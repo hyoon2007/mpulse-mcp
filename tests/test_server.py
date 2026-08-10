@@ -240,6 +240,62 @@ async def test_query_caps_high_cardinality_by_default(wired_client) -> None:
     assert result["truncated"]["returned"] == 100
 
 
+# --- custom dimension gating ------------------------------------------------
+@respx.mock
+async def test_query_rejects_custom_dimension_for_dimension_values(wired_client) -> None:
+    route = respx.get(_q_url("KEY-ALPHA", "dimension-values")).mock(
+        return_value=httpx.Response(200, json={"values": []})
+    )
+    try:
+        result = await server.query(
+            query_type="dimension-values",
+            params={"dimension": "branch", "date-comparator": "LastHour"},
+        )
+    finally:
+        await wired_client.aclose()
+    assert result["error"] == "ValidationError"
+    assert "metrics-by-dimension" in result["message"]
+    assert route.call_count == 0  # rejected before any upstream call
+
+
+@respx.mock
+async def test_query_allows_custom_dimension_for_metrics_by_dimension(
+    wired_client,
+) -> None:
+    respx.put(TOKENS_URL).mock(return_value=httpx.Response(201, json={"token": "T"}))
+    route = respx.get(_q_url("KEY-ALPHA", "metrics-by-dimension")).mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
+    try:
+        result = await server.query(
+            query_type="metrics-by-dimension",
+            params={"dimension": "branch", "metric": "beacons",
+                    "date-comparator": "LastHour"},
+        )
+    finally:
+        await wired_client.aclose()
+    # custom dim passes through untouched to the API.
+    assert "error" not in result
+    assert route.calls.last.request.url.params["dimension"] == "branch"
+
+
+@respx.mock
+async def test_query_autocorrects_builtin_dimension_casing(wired_client) -> None:
+    respx.put(TOKENS_URL).mock(return_value=httpx.Response(201, json={"token": "T"}))
+    route = respx.get(_q_url("KEY-ALPHA", "dimension-values")).mock(
+        return_value=httpx.Response(200, json={"values": ["Chrome/1"]})
+    )
+    try:
+        result = await server.query(
+            query_type="dimension-values",
+            params={"dimension": "Browser", "date-comparator": "LastHour"},
+        )
+    finally:
+        await wired_client.aclose()
+    assert route.calls.last.request.url.params["dimension"] == "browser"
+    assert any("auto-corrected" in c for c in result.get("corrections", []))
+
+
 # --- probe / empty_reason (#5) ---------------------------------------------
 def _summary_drilldown_probe(request: httpx.Request):
     """Empty when drilled down (page-group present), data at the base."""

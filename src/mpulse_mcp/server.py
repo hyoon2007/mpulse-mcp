@@ -579,6 +579,13 @@ async def query(
             "message": "Provide either 'date' or 'date-comparator', not both.",
         }
 
+    # Reject a custom dimension on the endpoints that don't accept one
+    # (dimension-values / dimension-over-time), before spending a wasted call;
+    # auto-correct a built-in's casing. metrics-by-dimension accepts custom names.
+    dim_note = _resolve_dimension_param(query_type, wire)
+    if isinstance(dim_note, dict):  # a ValidationError payload
+        return dim_note
+
     effective_limit = limit
     if effective_limit is None and query_type in _HIGH_CARDINALITY_QUERY_TYPES:
         effective_limit = _DEFAULT_HIGH_CARDINALITY_LIMIT
@@ -601,9 +608,45 @@ async def query(
         history_mode=history_mode,
         limit=effective_limit,
     )
+    if isinstance(dim_note, str):
+        result.setdefault("corrections", []).append(dim_note)
     if probe:
         await _probe_empty_reason(client, app, query_type, wire, result)
     return result
+
+
+def _resolve_dimension_param(
+    query_type: str, wire: dict[str, Any]
+) -> dict[str, Any] | str | None:
+    """Validate/auto-correct the ``dimension`` wire param for dimension endpoints.
+
+    Returns a ValidationError payload (dict) to short-circuit, a correction note
+    (str) when a built-in's casing was fixed, or ``None`` when there is nothing
+    to do (custom dimension accepted, exact match, or non-dimension query-type).
+    """
+    from .catalog import resolve_dimension
+
+    value = wire.get("dimension")
+    status, payload = resolve_dimension(value, query_type)
+    if status == "ok" and payload != value:
+        wire["dimension"] = payload
+        return f"dimension {value!r} auto-corrected to {payload!r}"
+    if status == "unknown_no_custom":
+        hint = (
+            f"'{query_type}' accepts BUILT-IN dimensions only — custom dimensions "
+            "(e.g. 'branch') are not supported here. To break data down by a "
+            "custom dimension, use metrics-by-dimension with dimension=<name>."
+        )
+        if payload:
+            hint += f" Or did you mean a built-in: {', '.join(payload)}?"
+        return {
+            "error": "ValidationError",
+            "message": (
+                f"Unknown dimension {value!r} for query-type '{query_type}'.\n"
+                f"Hint: {hint}"
+            ),
+        }
+    return None
 
 
 # ===========================================================================
