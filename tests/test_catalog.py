@@ -89,6 +89,45 @@ def test_enrich_surfaces_parameter_mechanics() -> None:
     assert "comma_separated_params" not in e2["parameter_mechanics"]
 
 
+# --- endpoint-specific parameter specs -------------------------------------
+def test_endpoint_params_metrics_by_dimension() -> None:
+    ep = catalog.enrich_describe("metrics-by-dimension")["endpoint_params"]
+    assert "metrics" in ep["value_params"]
+    assert set(ep["special_params"]) == {"limit", "sortby"}
+    assert ep["filters"] is True
+    assert any("apperror" in c for c in ep["constraints"])
+    assert "columnNames" in ep["response_shape"]
+
+
+def test_endpoint_params_report_endpoints_have_no_native_limit() -> None:
+    for qt in ("geography", "page-groups", "browsers", "ab-tests", "bandwidth"):
+        ep = catalog.enrich_describe(qt)["endpoint_params"]
+        assert "limit" not in ep["special_params"]
+        assert "sortby" not in ep["special_params"]
+    # bandwidth: series-format but NO percentile
+    bw = catalog.enrich_describe("bandwidth")["endpoint_params"]
+    assert "series-format" in bw["special_params"]
+    assert "percentile" not in bw["value_params"]
+
+
+def test_endpoint_params_dimension_values_has_no_filters() -> None:
+    ep = catalog.enrich_describe("dimension-values")["endpoint_params"]
+    assert ep["filters"] is False
+
+
+def test_dimension_over_time_uses_own_enum() -> None:
+    e = catalog.enrich_describe("dimension-over-time")
+    dims = e["valid_dimensions"]
+    assert "bandwidth_block" in dims and "url" in dims  # dot-specific names
+    ep = e["endpoint_params"]
+    assert "interval" in ep["special_params"]
+    assert ep["special_params"]["limit"].startswith("1-10")
+    # custom dimension is NOT allowed here -> rejected
+    assert catalog.resolve_dimension("branch", "dimension-over-time")[0] == (
+        "unknown_no_custom"
+    )
+
+
 # --- custom dimension support ----------------------------------------------
 def test_custom_dimension_supported_flags() -> None:
     assert catalog.custom_dimension_supported("metrics-by-dimension") is True

@@ -153,11 +153,13 @@ def _dimension_enum_for(query_type: str) -> list[str]:
     dims = _dimensions()
     dv = list(dims.get("dimension_values__dimension_enum", {}).get("enum", []))
     mbd = list(dims.get("metrics_by_dimension__dimension_split_enum", {}).get("enum", []))
+    dot = list(dims.get("dimension_over_time__dimension_enum", {}).get("enum", []))
     if query_type == "dimension-values":
         return dv
     if query_type in ("dimension-over-time", "dimensions-over-time"):
-        # built-in only; accept either enum's names to avoid false rejections.
-        return list(dict.fromkeys(dv + mbd))
+        # Prefer the dedicated dot enum; fall back to the union to avoid false
+        # rejections if it's ever absent.
+        return dot or list(dict.fromkeys(dv + mbd))
     if query_type == "metrics-by-dimension":
         return mbd
     return []
@@ -234,21 +236,17 @@ def enrich_describe(query_type: str) -> dict[str, Any]:
     ):
         out["valid_timers"] = _timers()
 
-    # dimension enums (context-specific)
+    # dimension enums (context-specific; each endpoint has its OWN valid set)
     if query_type == "dimension-values":
         out["valid_dimensions"] = list(
             dims.get("dimension_values__dimension_enum", {}).get("enum", [])
         )
-    if query_type in (
-        "metrics-by-dimension",
-        "dimension-over-time",
-        "dimensions-over-time",
-    ):
+    if query_type == "metrics-by-dimension":
         out["valid_dimensions"] = list(
-            dims.get("metrics_by_dimension__dimension_split_enum", {}).get(
-                "enum", []
-            )
+            dims.get("metrics_by_dimension__dimension_split_enum", {}).get("enum", [])
         )
+    if query_type in ("dimension-over-time", "dimensions-over-time"):
+        out["valid_dimensions"] = _dimension_enum_for(query_type)
 
     # Whether a CUSTOM dimension (e.g. 'branch') is accepted for the `dimension`
     # param — true only for metrics-by-dimension. Surfacing this stops the model
@@ -280,6 +278,15 @@ def enrich_describe(query_type: str) -> dict[str, Any]:
     custom_dims = catalog.get("custom_dimensions")
     if custom_dims:
         out["custom_dimensions"] = custom_dims
+
+    # Per-endpoint parameter contract: value params, special params (limit,
+    # sortby, interval, series-format), whether drilldown filters apply, and
+    # constraints. Compiled from each get-*.md reference page.
+    ep = catalog.get("endpoint_params", {}).get(query_type)
+    if isinstance(ep, dict):
+        out["endpoint_params"] = {
+            k: v for k, v in ep.items() if not k.startswith("_")
+        }
 
     # How to pass multiple values (comma vs repeated key vs single) — the whole
     # point of this: the model must know the per-param mechanism to set values.

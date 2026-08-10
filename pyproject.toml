@@ -1,6 +1,6 @@
 [project]
 name = "mpulse-mcp"
-version = "0.9.0"
+version = "0.10.0"
 description = "MCP server wrapping the Akamai mPulse Query API (RUM aggregate data) for Claude Desktop."
 readme = "README.md"
 requires-python = ">=3.11"
