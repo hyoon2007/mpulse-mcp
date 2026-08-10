@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 import sys
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 # A single package-level logger wired to *stderr*. Importing this module has the
 # side effect of configuring logging so that nothing ever leaks onto stdout.

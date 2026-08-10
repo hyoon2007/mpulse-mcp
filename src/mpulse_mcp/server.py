@@ -8,6 +8,7 @@ JSON-RPC stream; all logging goes to stderr (see ``mpulse_mcp.log``).
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 from typing import Any
 
@@ -508,6 +509,237 @@ async def query(
         raw=raw,
         history_mode=history_mode,
     )
+
+
+# ===========================================================================
+# Batch aggregate tool
+# ===========================================================================
+def _norm_name(name: str) -> str:
+    return "".join(c for c in str(name).lower() if c.isalnum())
+
+
+def _build_period(period: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """Turn one period spec into a (label, wire-params) pair, validating it.
+
+    A period is ``{date}`` (single calendar day) OR ``{date_comparator, ...}``
+    (relative; ``Between`` needs ``date_start``+``date_end``, ``Last`` needs
+    ``trailing_seconds``). An optional ``label`` names the column.
+    """
+    if not isinstance(period, dict):
+        raise ValidationError("Each period must be an object.")
+    dc = period.get("date_comparator")
+    date = period.get("date")
+    if dc and date:
+        raise ValidationError(
+            "A period cannot set both 'date' and 'date_comparator'."
+        )
+    wire: dict[str, Any] = {}
+    if dc:
+        wire["date-comparator"] = dc
+        if dc == "Between":
+            ds, de = period.get("date_start"), period.get("date_end")
+            if not ds or not de:
+                raise ValidationError(
+                    "date_comparator='Between' requires 'date_start' and "
+                    "'date_end' (date_end is exclusive)."
+                )
+            wire["date-start"], wire["date-end"] = ds, de
+            label = period.get("label") or f"{ds}..{de}"
+        elif dc == "Last":
+            ts = period.get("trailing_seconds")
+            if ts is None:
+                raise ValidationError(
+                    "date_comparator='Last' requires 'trailing_seconds'."
+                )
+            wire["trailing-seconds"] = ts
+            label = period.get("label") or f"Last{ts}s"
+        else:
+            label = period.get("label") or dc
+    elif date:
+        _check_single_day(date)
+        wire["date"] = date
+        label = period.get("label") or date
+    else:
+        raise ValidationError("Each period needs 'date' or 'date_comparator'.")
+    return label, wire
+
+
+def _extract_latest(data: dict[str, Any], name: str) -> tuple[Any, str | None]:
+    """Pull the period aggregate (`latest`) for `name` from a timers-metrics body.
+
+    Returns ``(value, warning)``. Matches the requested name against the series
+    id case/separator-insensitively; a differing id means a silent fallback.
+    """
+    values = data.get("values")
+    if not isinstance(values, list) or not values:
+        return None, "empty result (no data, or unsupported drilldown combo)"
+    target = _norm_name(name)
+    for v in values:
+        if isinstance(v, dict) and _norm_name(v.get("id", "")) == target:
+            return v.get("latest"), None
+    first = values[0] if isinstance(values[0], dict) else {}
+    return (
+        first.get("latest"),
+        f"requested {name!r} but mPulse returned id {first.get('id')!r} "
+        f"(silent fallback — value is NOT for the requested name)",
+    )
+
+
+@mcp.tool()
+async def get_aggregate(
+    metrics: list[str] | None = None,
+    timers: list[str] | None = None,
+    periods: list[dict[str, Any]] | None = None,
+    percentiles: list[int] | None = None,
+    app: str | None = None,
+    timezone: str | None = None,
+    page_group: str | None = None,
+    browser: str | None = None,
+    ab_test: str | None = None,
+    country: str | None = None,
+    device_type: str | None = None,
+    beacon_type: str | None = None,
+    max_combos: int = 24,
+) -> dict[str, Any]:
+    """Batch aggregate matrix: (metric|timer) × period × percentile → one table.
+
+    Collapses the common reporting workflow — e.g. 3 metrics × 2 months × p50/p75
+    (which is 12 separate calls) — into ONE tool call. Internally it issues one
+    `timers-metrics` query per cell and returns **only the period aggregate**
+    (`latest`), with NO per-minute history, so a dozen large responses become a
+    small table of scalars.
+
+    Inputs:
+    - `metrics` / `timers`: name lists (at least one across the two). Metric
+      names are the timers-metrics (CamelCase) space; unknown names are rejected
+      up front with suggestions, casing is auto-corrected.
+    - `periods`: list of period objects, each `{date: "YYYY-MM-DD"}` OR
+      `{date_comparator: "Last24Hours" | "ThisMonth" | ...}`; `Between` needs
+      `date_start`+`date_end` (date_end exclusive), `Last` needs
+      `trailing_seconds`. Optional `label` names the column.
+    - `percentiles`: e.g. `[50, 75]` (default `[50]`).
+    - drilldowns (`page_group`, `browser`, `country`, `device_type`, …) and
+      `timezone` apply to every cell.
+    - `max_combos` (default 24) caps `len(targets) × len(periods) ×
+      len(percentiles)` to prevent an accidental fan-out.
+
+    Returns `{app, timezone, drilldowns, table: [{target, kind, period,
+    percentile, value, [warning]}], [errors], [corrections]}`. Cells fail
+    independently: a failed cell appears in `errors`, the rest still return.
+    All calls go through the shared rate limiter (concurrency 3, 100/min).
+    """
+    from .catalog import resolve_value
+
+    client = _get_client()
+    app_name = app or client.registry.default_app
+    pcts = percentiles or [50]
+
+    try:
+        targets: list[tuple[str, str]] = [("metric", m) for m in (metrics or [])]
+        targets += [("timer", t) for t in (timers or [])]
+        if not targets:
+            raise ValidationError("Provide at least one of 'metrics' or 'timers'.")
+        if not periods:
+            raise ValidationError("Provide at least one period in 'periods'.")
+
+        combos = len(targets) * len(periods) * len(pcts)
+        if combos > max_combos:
+            raise ValidationError(
+                f"{combos} combinations exceed max_combos={max_combos}.",
+                hint="Reduce metrics/periods/percentiles, or raise max_combos.",
+            )
+
+        corrections: list[str] = []
+        resolved: list[tuple[str, str]] = []
+        for kind, name in targets:
+            status, payload = resolve_value(kind, name, "timers-metrics")
+            if status == "unknown":
+                hint = (
+                    f"Did you mean: {', '.join(payload)}?"
+                    if payload
+                    else "Call describe_query('timers-metrics') for valid names."
+                )
+                raise ValidationError(
+                    f"Unknown {kind} {name!r}.", hint=hint
+                )
+            canonical = payload if status == "ok" else name
+            if status == "ok" and canonical != name:
+                corrections.append(f"{kind} {name!r} auto-corrected to {canonical!r}")
+            resolved.append((kind, canonical))
+
+        built_periods = [_build_period(p) for p in periods]
+    except MpulseError as exc:
+        return {"error": type(exc).__name__, "message": exc.user_message()}
+
+    drilldowns = _collect_drilldowns(
+        {
+            "page_group": page_group,
+            "browser": browser,
+            "ab_test": ab_test,
+            "country": country,
+            "device_type": device_type,
+            "beacon_type": beacon_type,
+        }
+    )
+
+    async def _cell(
+        kind: str, name: str, plabel: str, pwire: dict[str, Any], pct: int
+    ) -> tuple[str, dict[str, Any]]:
+        params: dict[str, Any] = {**drilldowns, **pwire, kind: name, "percentile": pct}
+        if timezone:
+            params["timezone"] = timezone
+        try:
+            data = await client.query(
+                app=app, query_type="timers-metrics", params=params
+            )
+        except MpulseError as exc:
+            return (
+                "error",
+                {
+                    "target": name,
+                    "kind": kind,
+                    "period": plabel,
+                    "percentile": pct,
+                    "message": exc.user_message(),
+                },
+            )
+        value, warn = _extract_latest(data, name)
+        row: dict[str, Any] = {
+            "target": name,
+            "kind": kind,
+            "period": plabel,
+            "percentile": pct,
+            "value": value,
+        }
+        if warn:
+            row["warning"] = warn
+        return ("row", row)
+
+    cells = [
+        _cell(kind, name, plabel, pwire, pct)
+        for (kind, name) in resolved
+        for (plabel, pwire) in built_periods
+        for pct in pcts
+    ]
+    results = await asyncio.gather(*cells)
+
+    table = [r for (tag, r) in results if tag == "row"]
+    errors = [r for (tag, r) in results if tag == "error"]
+
+    out: dict[str, Any] = {
+        "app": app_name,
+        "query_type": "aggregate(timers-metrics.latest)",
+        "timezone": timezone or "UTC",
+        "drilldowns": drilldowns,
+        "percentiles": pcts,
+        "targets": [name for (_, name) in resolved],
+        "table": table,
+    }
+    if corrections:
+        out["corrections"] = corrections
+    if errors:
+        out["errors"] = errors
+    return out
 
 
 # ===========================================================================

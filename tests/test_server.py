@@ -106,3 +106,117 @@ async def test_run_valid_metric_passes_through(wired_client) -> None:
     assert route.calls.last.request.url.params["metric"] == "Beacons"
     assert "corrections" not in result  # exact match -> no correction note
     assert "error" not in result
+
+
+# --- get_aggregate ---------------------------------------------------------
+def _echo_latest(request: httpx.Request) -> httpx.Response:
+    """Echo the requested metric/timer as the series id, latest == percentile."""
+    p = request.url.params
+    name = p.get("metric") or p.get("timer")
+    pct = int(p.get("percentile", "50"))
+    return httpx.Response(
+        200, json={"values": [{"id": name, "history": [1], "latest": pct}]}
+    )
+
+
+@respx.mock
+async def test_get_aggregate_matrix(wired_client) -> None:
+    respx.put(TOKENS_URL).mock(return_value=httpx.Response(201, json={"token": "T"}))
+    respx.get(_q_url("KEY-ALPHA", "timers-metrics")).mock(side_effect=_echo_latest)
+    try:
+        result = await server.get_aggregate(
+            metrics=["Beacons"],
+            timers=["PageLoad"],
+            periods=[
+                {"date_comparator": "ThisMonth", "label": "thismonth"},
+                {"date": "2026-06-15"},
+            ],
+            percentiles=[50, 75],
+        )
+    finally:
+        await wired_client.aclose()
+
+    # 2 targets × 2 periods × 2 percentiles = 8 cells, all successful.
+    assert len(result["table"]) == 8
+    assert "errors" not in result
+    assert set(result["targets"]) == {"Beacons", "PageLoad"}
+    # latest echoes the percentile, so each cell's value == its percentile.
+    for row in result["table"]:
+        assert row["value"] == row["percentile"]
+
+
+@respx.mock
+async def test_get_aggregate_max_combos_guard(wired_client) -> None:
+    query = respx.get(_q_url("KEY-ALPHA", "timers-metrics")).mock(
+        side_effect=_echo_latest
+    )
+    try:
+        result = await server.get_aggregate(
+            metrics=["Beacons", "AppErrors"],
+            periods=[{"date": "2026-06-15"}, {"date": "2026-07-15"}],
+            percentiles=[50, 75],
+            max_combos=3,  # 2×2×2 = 8 > 3
+        )
+    finally:
+        await wired_client.aclose()
+    assert result["error"] == "ValidationError"
+    assert query.call_count == 0  # rejected before any upstream call
+
+
+@respx.mock
+async def test_get_aggregate_rejects_unknown_metric(wired_client) -> None:
+    query = respx.get(_q_url("KEY-ALPHA", "timers-metrics")).mock(
+        side_effect=_echo_latest
+    )
+    try:
+        result = await server.get_aggregate(
+            metrics=["totally_bogus_metric_xyz"],
+            periods=[{"date_comparator": "LastHour"}],
+        )
+    finally:
+        await wired_client.aclose()
+    assert result["error"] == "ValidationError"
+    assert query.call_count == 0
+
+
+@respx.mock
+async def test_get_aggregate_partial_failure(wired_client) -> None:
+    respx.put(TOKENS_URL).mock(return_value=httpx.Response(201, json={"token": "T"}))
+
+    def _one_fails(request: httpx.Request) -> httpx.Response:
+        if request.url.params.get("metric") == "AppErrors":
+            return httpx.Response(403, text="Forbidden")
+        return _echo_latest(request)
+
+    respx.get(_q_url("KEY-ALPHA", "timers-metrics")).mock(side_effect=_one_fails)
+    try:
+        result = await server.get_aggregate(
+            metrics=["Beacons", "AppErrors"],
+            periods=[{"date_comparator": "LastHour"}],
+            percentiles=[50],
+        )
+    finally:
+        await wired_client.aclose()
+
+    # Beacons cell succeeds; AppErrors cell fails independently.
+    assert len(result["table"]) == 1
+    assert result["table"][0]["target"] == "Beacons"
+    assert len(result["errors"]) == 1
+    assert result["errors"][0]["target"] == "AppErrors"
+
+
+@respx.mock
+async def test_get_aggregate_autocorrects_metric(wired_client) -> None:
+    respx.put(TOKENS_URL).mock(return_value=httpx.Response(201, json={"token": "T"}))
+    route = respx.get(_q_url("KEY-ALPHA", "timers-metrics")).mock(
+        side_effect=_echo_latest
+    )
+    try:
+        result = await server.get_aggregate(
+            metrics=["beacons"],  # wrong casing
+            periods=[{"date_comparator": "LastHour"}],
+        )
+    finally:
+        await wired_client.aclose()
+    assert "corrections" in result
+    assert route.calls.last.request.url.params["metric"] == "Beacons"
