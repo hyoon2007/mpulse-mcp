@@ -2,75 +2,124 @@
 
 `src/mpulse_mcp/catalog.json` + `src/mpulse_mcp/catalog.py`.
 
-목적: 유효한 metric·timer·dimension 이름과 동작 규칙을 미리 확정해, 에이전트가 매번 시행착오로 재탐색하지 않게 한다. 출처: Akamai TechDocs 엔드포인트 레퍼런스 페이지 + Akamai cli-mpulse + 라이브 API(app=app-a) 실증.
+Purpose: pin down the valid metric/timer/dimension names and behavioral rules up
+front so the agent doesn't re-discover them by trial and error on every call.
+Sources: Akamai TechDocs endpoint reference pages + Akamai cli-mpulse + live API
+verification (app=app-a).
 
-## 구성
+## Layout
 
-- **`catalog.json`** — 권위 있는 enum/규칙 데이터(머신 판). hatchling 휠에 자동 포함됨.
-- **`catalog.py`** — fail-safe 로더. JSON이 없거나 깨져도 `{}`를 반환하므로 서버 동작에 영향 없음.
-- **`server.py`의 `describe_query`** — 응답에 `catalog.enrich_describe(query_type)` 결과를 병합. 이제 query type별로 아래를 실어준다:
-  - `valid_metrics` (엔드포인트에 맞는 이름 목록)
+- **`catalog.json`** — the authoritative enum/rule data (machine-readable).
+  Bundled into the hatchling wheel automatically.
+- **`catalog.py`** — a fail-safe loader. Returns `{}` if the JSON is missing or
+  malformed, so it never affects server operation.
+- **`describe_query` in `server.py`** — merges `catalog.enrich_describe(query_type)`
+  into its response. It now includes, per query type:
+  - `valid_metrics` (the name list appropriate to the endpoint)
   - `valid_timers`
   - `valid_dimensions`
   - `dimension_value_examples`, `gotchas`, `metric_name_differs_by_endpoint`
+  - `endpoint_params` (per-endpoint value/special params + constraints) and
+    `parameter_mechanics` (comma vs repeat-key vs single)
 
-즉 `describe_query("timers-metrics")` 한 번이면 metric 98종·timer 24종과 함정 목록까지 나온다.
+So a single `describe_query("timers-metrics")` returns the 98 metrics, 24 timers,
+and the list of gotchas.
 
-## 가장 중요한 함정 — 같은 지표, 엔드포인트마다 다른 이름
+## The most important gotcha — same metric, different name per endpoint
 
-| 개념 | `timers-metrics` (CamelCase) | `metrics-by-dimension` (snake_case) |
+| Concept | `timers-metrics` (CamelCase) | `metrics-by-dimension` (snake_case) |
 |---|---|---|
-| 페이지당 요청 수 | `TotalRequestCount` * | `asset_requests_per_page` |
+| Requests per page | `TotalRequestCount` * | `asset_requests_per_page` |
 | Decoded Body Size | `TotalDecodedBodySize` | `asset_decoded_body_size` |
 | Transfer Size | `TotalTransferSize` | `asset_transfer_size` |
 
-`*` `TotalRequestCount`는 timers-metrics 문서 enum엔 없지만(Total* 그룹 8개 = 문서 "97개"와 일치) 라이브에선 정상 동작(실증: 6월 p75=142, 7월=151). `catalog.json`의 `verified_live_extra`로 별도 수록.
+`*` `TotalRequestCount` is not in the timers-metrics doc enum (the Total* group
+lists 8, matching the doc's "97") yet works live (verified: June p75=142,
+July=151). Recorded separately as `verified_live_extra` in `catalog.json`.
 
-## enum 요약 (전체는 catalog.json)
+## Enum summary (full lists in catalog.json)
 
-- **timers-metrics `metric`** — CamelCase 97종(+TotalRequestCount). 접두사 `Bcn/Css/Font/Html/Img/Js/Other/Page/Total/Xhr` × 접미사 `RequestCount/TransferSize/DecodedBodySize/CompressionRatio/…`.
-- **metrics-by-dimension 지표 파라미터 = `metrics`(복수, 콤마구분)** — snake_case 82종(`asset_*`, `css_*`, `js_*`, `image_*`, `font_*`, `html_*`, `xhr_*`, `other_*`, `page_*`, `beacon_*` 계열). 예: `metrics=beacons,largest_contentful_paint`. **`metric`(단수)은 조용히 무시**되고 앱 기본 컬럼 반환. `percentile` 계산 지원 + `sortby`/`limit`(네이티브) 보유. 응답은 `{columnNames, data:[[행]]}` 테이블.
-- **metric-per-page-load-time `metric`** — 단수 전용, 기본 `BounceRate`, enum `BounceRate` + `CustomMetric0-9`(다른 엔드포인트와 완전히 다른 이름공간).
-- **timer** — 24종(`PageLoad` 기본 … `LargestContentfulPaint`, `TotalBlockingTime`, `CustomTimer[0-9]`).
-- **dimension-values `dimension`** — 24종(underscore). `connection_type` 없음 → dimension-values에서 `connection-type` 400.
-- **metrics-by-dimension split `dimension`** — 33종(underscore).
-- **beacon-type** 9종(`page view`, `xhr`, `spa_hard`, `spa`, …). **device-type** `Mobile/Desktop/Tablet`(+라이브 `(No Value)`). **bandwith-block** 0–6/.NONE.
+- **timers-metrics `metric`** — 97 CamelCase names (+`TotalRequestCount`).
+  Prefixes `Bcn/Css/Font/Html/Img/Js/Other/Page/Total/Xhr` × suffixes
+  `RequestCount/TransferSize/DecodedBodySize/CompressionRatio/…`.
+- **metrics-by-dimension metric param = `metrics` (PLURAL, comma-separated)** —
+  82 snake_case names (`asset_*`, `css_*`, `js_*`, `image_*`, `font_*`, `html_*`,
+  `xhr_*`, `other_*`, `page_*`, `beacon_*` families). Example:
+  `metrics=beacons,largest_contentful_paint`. **The singular `metric` is silently
+  ignored** and app-default columns are returned. Supports `percentile`
+  computation and has native `sortby`/`limit`. Response is a
+  `{columnNames, data:[[row]]}` table.
+- **metric-per-page-load-time `metric`** — single-value only, default
+  `BounceRate`, enum `BounceRate` + `CustomMetric0-9` (a completely different name
+  space from the other endpoints).
+- **timer** — 24 values (`PageLoad` default … `LargestContentfulPaint`,
+  `TotalBlockingTime`, `CustomTimer[0-9]`).
+- **dimension-values `dimension`** — 24 values (underscore). `connection_type` is
+  absent → `connection-type` gives a 400 on dimension-values.
+- **metrics-by-dimension split `dimension`** — 33 values (underscore).
+- **beacon-type** 9 values (`page view`, `xhr`, `spa_hard`, `spa`, …).
+  **device-type** `Mobile/Desktop/Tablet` (+ live `(No Value)`). **bandwith-block**
+  0–6/.NONE.
 
-## 동작 규칙(gotchas)
+## Behavioral rules (gotchas)
 
-- 잘못된 `timer`/`metric` → 에러 없이 **PageLoad로 조용히 폴백**. 응답 series `id`가 요청 이름과 같은지 확인.
-- 잘못된 `custom-timer` → **400**.
-- **멀티값 메커니즘 (파라미터별로 다름)**: ① `metrics`(metrics-by-dimension)만 **콤마구분 1개 파라미터**. ② `metric`·`timer`(timers-metrics)와 **모든 드릴다운 필터·`custom-dimension-*`**는 **키 반복**(`country=US&country=KR`) — MCP `query` 툴엔 **JSON 리스트**로 넘기면 client가 반복키로 직렬화(`custom-dimension-branch=["uk","us"]`, 라이브 검증). ③ 나머지는 단일.
-- metrics-by-dimension는 **percentile 계산 지원**(타이머 p75 by dimension = timers-metrics와 일치). 카운트 지표(beacons)+percentile 혼합은 컬럼 null 유발 가능 → 타이머/percentile 계열끼리.
-- **`latest` = 구간 전체 집계값**. percentile metric을 `Between`으로 조회하면 `latest`가 구간 전체 백분위 → 월 p75/p50은 일별 history 평균이 아니라 `latest`를 읽기.
-- `Between`의 `date-end`는 **exclusive**(문서는 "greater than"이라고만 함). 긴 구간은 버킷 자동 coarsening.
-- rate limit: 동시 3 / 분당 100 / 시간당 10,000 / 일 50,000.
+- An invalid `timer`/`metric` → **silently falls back to PageLoad** with no error.
+  Check that the response series `id` matches the requested name.
+- An invalid `custom-timer` → **400**.
+- **Multi-value mechanism (differs per parameter)**: (1) only `metrics`
+  (metrics-by-dimension) is a **single comma-separated param**. (2) `metric`/`timer`
+  (timers-metrics) and **all drilldown filters and `custom-dimension-*`** use a
+  **repeated key** (`country=US&country=KR`) — via the MCP `query` tool, pass a
+  **JSON list** and the client serializes it to repeated keys
+  (`custom-dimension-branch=["uk","us"]`, verified live). (3) everything else is
+  single.
+- metrics-by-dimension **computes percentiles** (timer p75 by dimension matches
+  timers-metrics). Mixing a count metric (beacons) with a percentile can yield a
+  null column → keep timer/percentile metrics together.
+- **`latest` = the whole-period aggregate**. Querying a percentile metric with
+  `Between` makes `latest` the period-wide percentile → read `latest` for a
+  monthly p75/p50, not the mean of the daily history.
+- `Between`'s `date-end` is **exclusive** (the doc only says "greater than").
+  Long ranges auto-coarsen the buckets.
+- Rate limits: concurrent 3 / 100 per minute / 10,000 per hour / 50,000 per day.
 
-## bandwidth 필터 파라미터 철자 — `bandwith-block` (라이브 확정, 코드 수정 완료)
+## Bandwidth filter parameter spelling — `bandwith-block` (confirmed live, fixed in code)
 
-mPulse의 실제 wire 파라미터는 **`bandwith-block`**(d 빠진 오타)이며, 정상 철자 `bandwidth-block`은 **동작하지 않습니다**(앱 소유자 라이브 검증). 이에 맞춰 코드도 수정했습니다:
+mPulse's actual wire parameter is **`bandwith-block`** (a typo missing the `d`);
+the correctly spelled `bandwidth-block` **does not work** (verified live by the app
+owner). The code was updated accordingly:
 - `query_types.DRILLDOWN_PARAMS`: `bandwidth-block` → `bandwith-block`
-- `server._DRILLDOWN_ARG_TO_WIRE`: 친화적 인자명 `bandwidth_block`은 유지하되 wire 값을 `bandwith-block`으로 매핑
+- `server._DRILLDOWN_ARG_TO_WIRE`: keeps the friendly arg name `bandwidth_block`
+  but maps the wire value to `bandwith-block`
 
-## Custom dimension 사용법
+## Using custom dimensions
 
-고객사가 정의한 custom dimension은 built-in enum에 없으며, **조회 API가 없어 사용자가 이름을 정확히 입력**해야 합니다.
+Customer-defined custom dimensions are not in the built-in enums, and **there is no
+API to list them, so the user must supply the exact name**.
 
-- **필터**로 사용: `custom-dimension-<label>=<value>` — 예: `branch=uk`로 필터링하려면 `custom-dimension-branch=uk`.
-- **분해(split)**로 사용: metrics-by-dimension에서 `dimension=<custom_name>` — 예: branch별 metric을 보려면 `dimension=branch`.
-- `<label>`은 custom dimension 이름을 소문자로, 공백은 `_`로. 값이 없는 beacon은 `.NONE`으로 매칭.
+- As a **filter**: `custom-dimension-<label>=<value>` — e.g. to filter to
+  `branch=uk`, use `custom-dimension-branch=uk`.
+- As a **split**: on metrics-by-dimension, `dimension=<custom_name>` — e.g. to break
+  a metric down by branch, use `dimension=branch`.
+- `<label>` is the custom dimension name lowercased, spaces replaced with `_`.
+  Beacons with no value match on `.NONE`.
 
-즉 `metrics_by_dimension__dimension_split_enum`의 33종은 built-in일 뿐이고, custom dimension 이름도 `dimension` 값으로 그대로 유효합니다.
+So the 33 names in `metrics_by_dimension__dimension_split_enum` are built-ins only;
+a custom dimension name is also valid directly as the `dimension` value.
 
-## 아직 못 채운 부분 — custom metric/timer/custom-dimension
+## Still missing — custom metrics/timers/custom-dimensions
 
-위 enum은 전부 **built-in**입니다. 이 앱 고유의 custom 항목은 공개 문서에 없고 다음에서만 나옵니다:
-- Repository/Objects API: `getRepositoryDomain(token, appName=...)["custom_metrics"]`
-- 또는 대시보드 report-builder의 `<option>` 목록.
+The enums above are all **built-in**. An app's own custom items are not in the
+public docs and appear only in:
+- the Repository/Objects API:
+  `getRepositoryDomain(token, appName=...)["custom_metrics"]`
+- or the dashboard report-builder's `<option>` list.
 
-확보되면 `catalog.json`에 `custom_metrics_by_app` 같은 섹션으로 병합하고, `catalog.enrich_describe`에서 앱별로 덧붙이면 됩니다.
+Once obtained, merge them into `catalog.json` as a section like
+`custom_metrics_by_app`, and append them per app in `catalog.enrich_describe`.
 
-## 유지보수
+## Maintenance
 
-- enum 갱신은 `catalog.json`만 수정하면 됨(코드 불변). 로더는 `@lru_cache`라 프로세스 재시작 시 반영.
-- 검증: `python -c "from mpulse_mcp import catalog; print(len(catalog.enrich_describe('timers-metrics')['valid_metrics']))"` → 98.
+- To update an enum, edit only `catalog.json` (no code change). The loader is
+  `@lru_cache`, so changes apply on process restart.
+- Verify: `python -c "from mpulse_mcp import catalog; print(len(catalog.enrich_describe('timers-metrics')['valid_metrics']))"` → 98.
