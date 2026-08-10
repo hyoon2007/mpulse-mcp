@@ -168,6 +168,13 @@ Each accepts `app` (optional → default app), **exactly one** of `date`
 (`page_group`, `browser`, `ab_test`, `country`, `device_type`, …), and
 `raw` (default `false`).
 
+**Batch**: `get_aggregate(metrics=[...], timers=[...], periods=[...],
+percentiles=[50,75], …)` — a `(metric|timer) × period × percentile` matrix in
+one call. Collapses the common reporting workflow (e.g. 3 metrics × 2 months ×
+p50/p75 = 12 calls) into a small table of `latest` scalars (no history). Each
+cell fails independently (`errors[]`); `max_combos` (default 24) caps the
+fan-out; all calls share the rate limiter. See [Batch aggregate](#batch-aggregate).
+
 **Generic**: `query(query_type, app=None, params={...}, raw=False)` — any
 query-type with wire-name params, for cases the explicit tools don't cover.
 
@@ -222,6 +229,33 @@ metadata and appears in `raw` mode too (data stays untouched).
 **Payload instrumentation.** Every successful query logs
 `payload app=… query=… bytes=… points=…` to **stderr**, for measuring response
 size / token cost (e.g. before/after future history-reduction work).
+
+### Batch aggregate
+
+`get_aggregate` runs a matrix of `timers-metrics` queries and returns only each
+cell's period aggregate (`latest`) — the value you'd read for a monthly p75.
+
+```jsonc
+get_aggregate(
+  metrics=["TotalRequestCount", "TotalTransferSize"],
+  periods=[
+    {"date_comparator": "Between", "date_start": "2026-06-01",
+     "date_end": "2026-07-01", "label": "June"},   // date_end exclusive
+    {"date_comparator": "Between", "date_start": "2026-07-01",
+     "date_end": "2026-08-01", "label": "July"}
+  ],
+  percentiles=[50, 75]
+)
+// -> { "table": [ {"target":"TotalRequestCount","period":"June",
+//                  "percentile":75,"value":142}, … 8 rows … ],
+//      "percentiles":[50,75], "targets":[…] }
+```
+
+Period objects are `{date: "YYYY-MM-DD"}` or `{date_comparator: …}` (`Between`
+needs `date_start`+`date_end`; `Last` needs `trailing_seconds`); `label` names
+the column. Names are validated/auto-corrected up front (one error, not N).
+A cell that fails lands in `errors[]` with its coordinates while the rest
+return; `max_combos` (default 24) guards `targets × periods × percentiles`.
 
 ### Constraints surfaced to the model
 
